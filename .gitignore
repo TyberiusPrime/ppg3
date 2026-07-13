@@ -1,14 +1,22 @@
 target/
+target_claude/
+target_rust_analyzer/
 *.so
 __pycache__/
 .pytest_cache/
 .venv/
+venv/
 dist/
 
-# The repo-root .gitignore has a `core*` rule intended for crash-dump
-# files (e.g. `core`, `core.12345`) that also unintentionally matches this
-# workspace's `core/` crate directory (ppg3-core, WP1/WP2-Rust). Un-ignore
-# it explicitly so `ppg3-core`'s sources are trackable.
+# nix build output symlinks
+result
+result-*
+
+# When ppg3 lived as a subdirectory of pypipegraph2, that repo's root
+# .gitignore had a `core*` rule (for crash-dump files like `core.12345`)
+# that also swept up this workspace's `core/` crate. The un-ignore below is
+# now redundant in the standalone repo but kept as a guard in case this tree
+# is ever vendored back under such a rule.
 !core/
 !core/**
 test/

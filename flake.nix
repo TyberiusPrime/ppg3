@@ -138,18 +138,28 @@
           '';
         };
 
+      # Third-party python deps (pyproject.toml's `test` group). Shared by the
+      # pytest checks and the dev shell.
+      pyDeps = ps: [
+        ps.pytest
+        ps.cloudpickle
+        ps.blake3
+        ps.libcst
+      ];
+
+      # Sealed test env: third-party deps + a *built* copy of ppg3 in
+      # site-packages. Used by the hermetic pytest checks.
       mkTestVenv =
         ver:
         let
           python = pkgs.${"python" + ver};
         in
-        python.withPackages (ps: [
-          ps.pytest
-          ps.cloudpickle
-          ps.blake3
-          ps.libcst
-          (mkPpg3Pkg python)
-        ]);
+        python.withPackages (ps: pyDeps ps ++ [ (mkPpg3Pkg python) ]);
+
+      # Dev env: third-party deps only, NO ppg3 — the dev shell puts the live
+      # working tree on PYTHONPATH instead (see the shellHook), so edits to
+      # python/ppg3 take effect without a rebuild.
+      mkDevEnv = ver: pkgs.${"python" + ver}.withPackages pyDeps;
 
       mkPytestCheck =
         ver:
@@ -196,8 +206,27 @@
           pkgs.bacon
           pkgs.maturin
           pkgs.git
-          (mkTestVenv "313")
+          (mkDevEnv "313")
         ];
+
+        # Editable ppg3: rather than installing a frozen copy, put the live
+        # working tree on PYTHONPATH so python/ppg3 edits are picked up
+        # immediately. ppg3's forkserver forwards PYTHONPATH to its template
+        # children (core/src/forkserver.rs `template_spawn_env`), so those
+        # subprocesses import the same live tree. The prebuilt abi3 extension
+        # is symlinked in so `import ppg3._core` works out of the box; re-run
+        # `maturin develop -m python/pyproject.toml` (or `cargo build -p
+        # ppg3-py`) after touching the Rust half. Delete the symlink and it
+        # will be recreated on the next `nix develop`.
+        shellHook = ''
+          repo_root=$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+          export PYTHONPATH="$repo_root/python''${PYTHONPATH:+:$PYTHONPATH}"
+          so="$repo_root/python/ppg3/_core.abi3.so"
+          if [ ! -e "$so" ]; then
+            ln -s ${ppg3-ext}/lib/libppg3_core_ext.so "$so"
+            echo "ppg3: linked prebuilt _core.abi3.so (run 'maturin develop -m python/pyproject.toml' to build your own)"
+          fi
+        '';
       };
 
       # Keep the pre-flakes `nix develop`-less workflow working too.

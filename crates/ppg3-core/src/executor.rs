@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use error_stack::{Report, ResultExt as _};
+
 use crate::error::Error;
 use crate::Result;
 
@@ -83,7 +85,13 @@ pub struct ExecResult {
 }
 
 pub trait Executor: Send + Sync {
-    fn run(&self, job: &PreparedJob) -> Result<ExecResult>;
+    /// Run the job. The error is an [`error_stack::Report`] so an
+    /// executor-level failure (spawn `ENOENT`, staging I/O, a forkserver
+    /// template that never started) carries a `file:line` context chain and
+    /// a backtrace all the way to the scheduler, which renders it into the
+    /// job's `failure.log`. A job that merely *exits non-zero* is `Ok` with
+    /// `exit_code != 0` — that is the job's failure, not the executor's.
+    fn run(&self, job: &PreparedJob) -> std::result::Result<ExecResult, Report<Error>>;
 
     /// Whether this executor provides real sandbox enforcement (bwrap /
     /// unshare) vs. best-effort staging only (`NoneExecutor`). Additive
@@ -99,7 +107,7 @@ fn ppg_name(virtual_path: &str) -> Result<&str> {
     Path::new(virtual_path)
         .file_name()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| Error::Other(format!("malformed virtual mount path: {virtual_path:?}")))
+        .ok_or_else(|| Report::new(Error::Other(format!("malformed virtual mount path: {virtual_path:?}"))))
 }
 
 // ============================================================ NoneExecutor
@@ -149,7 +157,7 @@ pub(crate) struct StagedJob {
 /// paths actually live. Lexical only (unlike `canonicalize`): store/tool
 /// paths that are already absolute pass through unchanged and need not exist.
 fn abs_target(p: &Path) -> Result<PathBuf> {
-    std::path::absolute(p).map_err(|e| Error::io(p, e))
+    std::path::absolute(p).map_err(|e| Report::new(Error::io(p, e)))
 }
 
 fn build_layout(job: &PreparedJob, work: &Path) -> Result<()> {
@@ -251,7 +259,7 @@ pub(crate) fn stage(job: &PreparedJob, work_parent: &Path) -> Result<StagedJob> 
 /// The sandboxed [`BwrapExecutor`] deliberately does **not** get these: it
 /// stages a real nix closure instead.
 pub(crate) const BOOTSTRAP_PASSTHROUGH_VARS: [&str; 4] =
-    ["PATH", "PYTHONPATH", "VIRTUAL_ENV", "REPO_ROOTA"];
+    ["PATH", "PYTHONPATH", "VIRTUAL_ENV", "REPO_ROOT"];
 
 /// The subset of [`BOOTSTRAP_PASSTHROUGH_VARS`] actually set in the
 /// coordinator's process env, ready to overlay a job's env *under* (the job
@@ -292,12 +300,13 @@ impl NoneExecutor {
 }
 
 impl Executor for NoneExecutor {
-    fn run(&self, job: &PreparedJob) -> Result<ExecResult> {
+    fn run(&self, job: &PreparedJob) -> std::result::Result<ExecResult, Report<Error>> {
         warn_once();
-        let staged = stage(job, &self.work_parent)?;
+        let staged = stage(job, &self.work_parent)
+            .attach_with(|| format!("NoneExecutor: staging job {:?}", job.ik))?;
 
         if staged.argv.is_empty() {
-            return Err(Error::Other("PreparedJob.argv is empty".to_string()));
+            return Err(Report::new(Error::Other("PreparedJob.argv is empty".to_string())));
         }
 
         // Weakly-hermetic bootstrap pass-through (shared with the forkserver
@@ -359,27 +368,47 @@ fn write_log_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Write a single consolidated `<log_dir>/failure.log` for a failed job:
-/// a header (job id + exit code), then the captured stderr (which for a
-/// python job already carries the rich traceback produced by `ppg3._shim`/
-/// `ppg3._template`), then the captured stdout. Returns the path so the
-/// scheduler can surface it in `RunReport.failed_details`. Shared by the
-/// cold-exec ([`NoneExecutor`]) and forkserver paths. Best-effort: a write
-/// error is not fatal to reporting the failure itself (the caller still has
-/// the in-memory stderr), so it is logged-and-swallowed by returning `None`
-/// on error.
+/// a header (job id + exit code), the rendered Rust error chain (when the
+/// failure was an executor-level [`error_stack::Report`], not just a
+/// non-zero exit), then the captured stderr (which for a python job already
+/// carries the rich traceback produced by `ppg3._shim`/`ppg3._template`),
+/// then the captured stdout. Returns the path so the scheduler can surface
+/// it in `RunReport.failed_details`. Shared by *both* scheduler failure
+/// branches (a non-zero `ExecResult` and an executor `Err`) and all three
+/// executors. Best-effort: a write error is not fatal to reporting the
+/// failure (the caller still has the in-memory text), so it returns `None`.
+///
+/// `exit_code` is `None` when no process ran (the executor itself errored —
+/// e.g. a template that never started); `rust_error` is the rendered
+/// `Report` chain (with `file:line` per frame) for that same case.
 pub(crate) fn write_failure_log(
     log_dir: &Path,
     job_id: &str,
-    exit_code: i32,
+    exit_code: Option<i32>,
+    rust_error: Option<&str>,
     stdout: &[u8],
     stderr: &[u8],
 ) -> Option<PathBuf> {
+    // The log dir normally exists (staging created it), but on an executor
+    // error *before* staging it may not — create it so the failure is never
+    // lost to a missing directory.
+    let _ = std::fs::create_dir_all(log_dir);
     let path = log_dir.join("failure.log");
     let mut buf: Vec<u8> = Vec::new();
     let _ = writeln!(buf, "ppg3 job failed: {job_id}");
-    let _ = writeln!(buf, "exit code: {exit_code}");
-    let _ = writeln!(buf);
-    let _ = writeln!(buf, "=== traceback / stderr ===");
+    match exit_code {
+        Some(code) => {
+            let _ = writeln!(buf, "exit code: {code}");
+        }
+        None => {
+            let _ = writeln!(buf, "exit code: (no process ran — executor error)");
+        }
+    }
+    if let Some(err) = rust_error {
+        let _ = writeln!(buf, "\n=== rust error (ppg3-core) ===");
+        let _ = writeln!(buf, "{}", err.trim_end());
+    }
+    let _ = writeln!(buf, "\n=== traceback / stderr ===");
     buf.extend_from_slice(stderr);
     if !stderr.ends_with(b"\n") {
         buf.push(b'\n');
@@ -536,10 +565,10 @@ pub fn nix_closure(roots: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {
                 ))
             })?;
         if !output.status.success() {
-            return Err(Error::Other(format!(
+            return Err(Report::new(Error::Other(format!(
                 "nix-store --query --requisites {root:?} failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
-            )));
+            ))));
         }
         let closure: BTreeSet<PathBuf> = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -548,9 +577,9 @@ pub fn nix_closure(roots: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {
             .map(PathBuf::from)
             .collect();
         if closure.is_empty() {
-            return Err(Error::Other(format!(
+            return Err(Report::new(Error::Other(format!(
                 "nix-store --query --requisites {root:?} returned an empty closure"
-            )));
+            ))));
         }
         union.extend(closure.iter().cloned());
         cache
@@ -576,10 +605,11 @@ impl BwrapExecutor {
 }
 
 impl Executor for BwrapExecutor {
-    fn run(&self, job: &PreparedJob) -> Result<ExecResult> {
+    fn run(&self, job: &PreparedJob) -> std::result::Result<ExecResult, Report<Error>> {
         std::fs::create_dir_all(&job.out_dir).map_err(|e| Error::io(&job.out_dir, e))?;
         std::fs::create_dir_all(&job.log_dir).map_err(|e| Error::io(&job.log_dir, e))?;
-        let closure = nix_closure(&nix_roots(job))?;
+        let closure = nix_closure(&nix_roots(job))
+            .attach_with(|| format!("BwrapExecutor: resolving nix closure for job {:?}", job.ik))?;
         let full_argv = bwrap_argv(job, &self.bwrap_path, &closure);
         let mut cmd = Command::new(&full_argv[0]);
         cmd.args(&full_argv[1..])
@@ -588,7 +618,8 @@ impl Executor for BwrapExecutor {
             .stderr(Stdio::piped());
         let output = cmd
             .output()
-            .map_err(|e| Error::Other(format!("spawning bwrap failed: {e}")))?;
+            .map_err(|e| Error::Other(format!("spawning bwrap failed: {e}")))
+            .attach_with(|| format!("BwrapExecutor: spawning {:?}", full_argv.first()))?;
         let stdout_path = job.log_dir.join("stdout.txt");
         let stderr_path = job.log_dir.join("stderr.txt");
         write_log_file(&stdout_path, &output.stdout)?;
@@ -1012,6 +1043,57 @@ mod tests {
         );
         let content = std::fs::read_to_string(out.path().join("marker.txt")).unwrap();
         assert_eq!(content, "from-env\n");
+    }
+
+    /// Executor-level failure #1 (NoneExecutor): a job whose `argv[0]` does
+    /// not exist can't be spawned, so `run` returns an `Err(Report<Error>)`
+    /// — not an `Ok` with a non-zero exit. The rendered report must carry the
+    /// message *and* a `file:line` origin in this crate (error-stack chain).
+    #[test]
+    fn none_executor_missing_binary_is_report_with_location() {
+        Report::set_color_mode(error_stack::fmt::ColorMode::None);
+        let parent = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let log = tempfile::tempdir().unwrap();
+        let exec = NoneExecutor::new(parent.path());
+        let job = none_job(
+            out.path(),
+            log.path(),
+            vec!["/nonexistent/definitely-not-a-binary".to_string()],
+            &[],
+        );
+        let report = exec.run(&job).expect_err("missing argv[0] must be an executor error");
+        assert!(matches!(report.current_context(), Error::Other(_)));
+        let rendered = format!("{report:?}");
+        assert!(rendered.contains("spawning"), "message missing:\n{rendered}");
+        assert!(
+            rendered.contains("executor.rs:"),
+            "no file:line origin in report:\n{rendered}"
+        );
+    }
+
+    /// Executor-level failure #2 (BwrapExecutor): a missing `bwrap` binary
+    /// fails to spawn. Needs no real `bwrap` and no nix store (the job
+    /// declares no `/nix/store` paths, so the closure query is skipped).
+    #[test]
+    fn bwrap_executor_missing_bwrap_is_report_with_location() {
+        Report::set_color_mode(error_stack::fmt::ColorMode::None);
+        let out = tempfile::tempdir().unwrap();
+        let log = tempfile::tempdir().unwrap();
+        let job = none_job(
+            out.path(),
+            log.path(),
+            vec!["/bin/sh".to_string(), "-c".to_string(), "true".to_string()],
+            &[],
+        );
+        let exec = BwrapExecutor::new("/nonexistent/bwrap");
+        let report = exec.run(&job).expect_err("missing bwrap must be an executor error");
+        let rendered = format!("{report:?}");
+        assert!(rendered.contains("bwrap"), "message missing:\n{rendered}");
+        assert!(
+            rendered.contains("executor.rs:"),
+            "no file:line origin in report:\n{rendered}"
+        );
     }
 
     #[test]

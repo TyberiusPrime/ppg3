@@ -20,17 +20,37 @@ from .io import JobIO
 from .jobs import File, Graph, GraphJob, Params, UnsandboxedJob
 
 
+# error-stack Debug-render decorations + backtrace noise we skip when
+# extracting a one-line summary from a reason blob.
+_DECOR_PREFIXES = ("╰╴", "├╴", "│", "╰─▶", "├─▶", "===", "---", "━", "backtrace")
+
+
+def _is_noise(line: str) -> bool:
+    if line.startswith(_DECOR_PREFIXES):
+        return True
+    # error-stack location frames ("at crates/...:8:9") and numbered
+    # backtrace frames ("  12: some::symbol").
+    if line.startswith("at ") and (".rs:" in line or "/rustc/" in line):
+        return True
+    head = line.split(":", 1)[0]
+    if head.isdigit():
+        return True
+    return False
+
+
 def _last_meaningful_line(text: str) -> str:
     """A one-line error summary from a reason/traceback blob: the final
     exception line if we can find one (our rich formatter's ``Exception: …``
-    or a trailing ``Type: value``), else the last non-empty line."""
-    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    or a trailing ``Type: value``), else the last substantive line — skipping
+    error-stack tree/backtrace decoration and section headers."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [ln for ln in lines if not _is_noise(ln)]
     if not lines:
         return ""
     for ln in reversed(lines):
         if ln.startswith("Exception: "):
             return ln[len("Exception: "):].strip()
-    return lines[-1].strip()
+    return lines[-1]
 
 
 class RunResult:

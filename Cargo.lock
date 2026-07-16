@@ -62,6 +62,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.103"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -222,6 +228,16 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "error-stack"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d01a8d4d427153bae0c38ca68d7912cbf9903fdcc97ecac18801738b3656a46d"
+dependencies = [
+ "anyhow",
+ "rustc_version",
 ]
 
 [[package]]
@@ -388,6 +404,7 @@ name = "ppg3-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "error-stack",
  "fs2",
  "libc",
  "serde",
@@ -400,6 +417,7 @@ dependencies = [
 name = "ppg3-py"
 version = "0.1.0"
 dependencies = [
+ "error-stack",
  "ppg3-core",
  "pyo3",
  "serde",
@@ -553,6 +571,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -570,6 +597,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

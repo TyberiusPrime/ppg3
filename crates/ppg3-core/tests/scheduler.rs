@@ -42,6 +42,10 @@ use ppg3_core::storeset::StoreSet;
 struct MockState {
     outputs: HashMap<String, Vec<(String, Vec<u8>)>>,
     exit_codes: HashMap<String, i32>,
+    /// Job ids the executor should *fail to run at all* for (an
+    /// `Err(Report<Error>)`, not a non-zero exit) — models a spawn/staging/
+    /// template-startup failure so the scheduler's `Err` branch is covered.
+    errors: HashMap<String, String>,
     delays: HashMap<String, Duration>,
     barriers: HashMap<String, Arc<Barrier>>,
     abort_on: HashMap<String, Arc<AtomicBool>>,
@@ -80,6 +84,10 @@ impl MockExecutor {
         self.state.lock().unwrap().exit_codes.insert(job_id.to_string(), code);
     }
 
+    fn set_error(&self, job_id: &str, msg: &str) {
+        self.state.lock().unwrap().errors.insert(job_id.to_string(), msg.to_string());
+    }
+
     fn set_delay(&self, job_id: &str, dur: Duration) {
         self.state.lock().unwrap().delays.insert(job_id.to_string(), dur);
     }
@@ -110,12 +118,22 @@ impl MockExecutor {
 }
 
 impl Executor for MockExecutor {
-    fn run(&self, job: &PreparedJob) -> ppg3_core::Result<ExecResult> {
+    fn run(
+        &self,
+        job: &PreparedJob,
+    ) -> std::result::Result<ExecResult, error_stack::Report<Error>> {
         let job_id = job
             .argv
             .get(1)
             .cloned()
             .unwrap_or_else(|| panic!("MockExecutor expects argv = [\"mock\", <job-id>], got {:?}", job.argv));
+
+        // Executor-level failure injection (the scheduler's `Err` branch):
+        // fail before recording an invocation, mirroring a real spawn error.
+        let injected = self.state.lock().unwrap().errors.get(&job_id).cloned();
+        if let Some(msg) = injected {
+            return Err(error_stack::Report::new(Error::Other(msg)));
+        }
 
         // NB: bind before the `if let` — in edition 2021 a `lock()` temporary
         // in the scrutinee lives to the end of the `if let` block, which would
@@ -205,7 +223,11 @@ impl HostCallbacks for TestCallbacks {
             .unwrap()
             .get(job_id)
             .cloned()
-            .ok_or_else(|| Error::Other(format!("no expansion configured for job {job_id:?}")))
+            .ok_or_else(|| {
+                error_stack::Report::new(Error::Other(format!(
+                    "no expansion configured for job {job_id:?}"
+                )))
+            })
     }
 
     fn run_in_process(&self, job_id: &str, key_doc: &Value) -> ppg3_core::Result<()> {
@@ -540,6 +562,58 @@ fn failure_propagation() {
     assert_eq!(exec.count("b"), 1);
 }
 
+/// A job that *runs but exits non-zero* gets a consolidated `failure.log`
+/// and structured `FailedJob` detail (exit_code + log path) — the branch
+/// every executor's non-zero `ExecResult` flows through.
+#[test]
+fn failure_log_written_on_nonzero_exit() {
+    let (_dir, storeset) = fresh_storeset();
+    let exec = MockExecutor::new();
+    exec.set_exit_code("b", 7);
+
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+    let report =
+        scheduler::run(&storeset, &exec, vec![base_job("b")], &callbacks, &parallelism(2, &[]), &abort)
+            .unwrap();
+
+    let detail = report.failed_details.get("b").expect("structured detail for b");
+    assert_eq!(detail.exit_code, Some(7));
+    let log_path = detail.failure_log.as_deref().expect("failure_log path present");
+    let text = std::fs::read_to_string(log_path).expect("failure.log must exist on disk");
+    assert!(text.contains("exit code: 7"), "log:\n{text}");
+    assert!(text.contains("configured to exit 7"), "captured stderr missing:\n{text}");
+}
+
+/// A job the *executor fails to run at all* (spawn/staging/template-startup)
+/// surfaces as an `Err(Report<Error>)`. It must ALSO get a `failure.log`
+/// (previously this branch produced none) with the rendered Rust error
+/// chain, and structured detail with `exit_code == None`.
+#[test]
+fn failure_log_written_on_executor_error() {
+    let (_dir, storeset) = fresh_storeset();
+    let exec = MockExecutor::new();
+    exec.set_error("b", "simulated staging failure (ENOENT)");
+
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+    let report =
+        scheduler::run(&storeset, &exec, vec![base_job("b")], &callbacks, &parallelism(2, &[]), &abort)
+            .unwrap();
+
+    let detail = report.failed_details.get("b").expect("structured detail for b");
+    assert_eq!(detail.exit_code, None, "no process ran, so no exit code");
+    let log_path = detail.failure_log.as_deref().expect("failure_log path present");
+    let text = std::fs::read_to_string(log_path).expect("failure.log must exist on disk");
+    assert!(text.contains("rust error"), "rust-error section missing:\n{text}");
+    assert!(
+        text.contains("simulated staging failure (ENOENT)"),
+        "rendered rust error missing:\n{text}"
+    );
+    // The reason surfaced to Python also carries the rust chain.
+    assert!(report.failed["b"].contains("ppg3-core error"));
+}
+
 /// Every pre-dispatch validation failure (cycle, unknown dep, duplicate id,
 /// over-capacity resource request) must surface as `Error::Graph` from
 /// `run()` itself, before the executor is ever touched.
@@ -555,7 +629,7 @@ fn graph_error_before_dispatch() {
         let b = dep_job("b", &[("x", "a")]);
         let err =
             scheduler::run(&storeset, &exec, vec![a, b], &callbacks, &parallelism(2, &[]), &abort).unwrap_err();
-        assert!(matches!(err, Error::Graph(_)), "cycle must be Error::Graph, got {err:?}");
+        assert!(matches!(err.current_context(), Error::Graph(_)), "cycle must be Error::Graph, got {err:?}");
         assert_eq!(exec.total_invocations(), 0);
     }
 
@@ -564,7 +638,7 @@ fn graph_error_before_dispatch() {
         let exec = MockExecutor::new();
         let a = dep_job("a", &[("x", "missing")]);
         let err = scheduler::run(&storeset, &exec, vec![a], &callbacks, &parallelism(2, &[]), &abort).unwrap_err();
-        assert!(matches!(err, Error::Graph(_)), "unknown dep must be Error::Graph, got {err:?}");
+        assert!(matches!(err.current_context(), Error::Graph(_)), "unknown dep must be Error::Graph, got {err:?}");
         assert_eq!(exec.total_invocations(), 0);
     }
 
@@ -575,7 +649,7 @@ fn graph_error_before_dispatch() {
         let a2 = base_job("a");
         let err =
             scheduler::run(&storeset, &exec, vec![a1, a2], &callbacks, &parallelism(2, &[]), &abort).unwrap_err();
-        assert!(matches!(err, Error::Graph(_)), "duplicate id must be Error::Graph, got {err:?}");
+        assert!(matches!(err.current_context(), Error::Graph(_)), "duplicate id must be Error::Graph, got {err:?}");
         assert_eq!(exec.total_invocations(), 0);
     }
 
@@ -586,7 +660,7 @@ fn graph_error_before_dispatch() {
         a.resources.insert("slots".to_string(), 10);
         let err = scheduler::run(&storeset, &exec, vec![a], &callbacks, &parallelism(2, &[("slots", 1)]), &abort)
             .unwrap_err();
-        assert!(matches!(err, Error::Graph(_)), "over-capacity request must be Error::Graph, got {err:?}");
+        assert!(matches!(err.current_context(), Error::Graph(_)), "over-capacity request must be Error::Graph, got {err:?}");
         assert_eq!(exec.total_invocations(), 0);
     }
 }
@@ -833,7 +907,7 @@ fn inprocess_loader() {
     let exec2 = MockExecutor::new();
     let err = scheduler::run(&storeset2, &exec2, vec![loader, consumer], &cb2, &parallelism(2, &[]), &abort)
         .unwrap_err();
-    assert!(matches!(err, Error::Graph(_)), "InProcess job as a store input must be Error::Graph, got {err:?}");
+    assert!(matches!(err.current_context(), Error::Graph(_)), "InProcess job as a store input must be Error::Graph, got {err:?}");
     assert_eq!(cb2.run_in_process_call_count(), 0, "validation must fail before any dispatch");
     assert_eq!(exec2.total_invocations(), 0);
 }

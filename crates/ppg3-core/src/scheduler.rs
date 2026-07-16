@@ -44,6 +44,8 @@ use serde_json::Value;
 
 use crate::canon;
 use crate::error::Error;
+use error_stack::Report;
+
 use crate::executor::{self, Executor, Mount, PreparedJob};
 use crate::lease::Lease;
 use crate::manifest::{BuiltInfo, ContentMap};
@@ -167,6 +169,11 @@ pub fn run(
     parallelism: &BTreeMap<String, u64>,
     abort: &AtomicBool,
 ) -> Result<RunReport> {
+    // error-stack renders `{:?}` with ANSI color when it thinks the sink is a
+    // TTY; our Reports go into `failure.log` files and JSON report strings, so
+    // force plain text globally (idempotent, cheap to set each run).
+    Report::set_color_mode(error_stack::fmt::ColorMode::None);
+
     let pools_cap = pool_capacities(parallelism);
     validate_and_index(&jobs, &HashMap::new(), &pools_cap)?;
 
@@ -238,13 +245,13 @@ fn validate_and_index(
     let mut seen: HashSet<&str> = HashSet::new();
     for j in new_jobs {
         if !seen.insert(j.id.as_str()) {
-            return Err(Error::Graph(format!("duplicate job id: {:?}", j.id)));
+            return Err(Report::new(Error::Graph(format!("duplicate job id: {:?}", j.id))));
         }
         if existing_jobs.contains_key(&j.id) {
-            return Err(Error::Graph(format!(
+            return Err(Report::new(Error::Graph(format!(
                 "job id {:?} already exists in the running graph",
                 j.id
-            )));
+            ))));
         }
     }
 
@@ -262,33 +269,34 @@ fn validate_and_index(
                 } else if let Some(p) = new_by_id.get(pid) {
                     p
                 } else {
-                    return Err(Error::Graph(format!(
+                    return Err(Report::new(Error::Graph(format!(
                         "job {:?} depends on unknown job {:?}",
                         j.id, pid
-                    )));
+                    ))));
                 };
-                if matches!(parent.exec_template, ExecTemplate::InProcess) {
-                    return Err(Error::Graph(format!(
+                if matches!(
+            parent.exec_template, ExecTemplate::InProcess) {
+                    return Err(Report::new(Error::Graph(format!(
                         "job {:?} references InProcess job {:?} as a store input (Job/JobSubset); \
                          InProcess jobs produce no store entry and can only be a scheduling barrier",
                         j.id, pid
-                    )));
+                    ))));
                 }
             }
         }
         for (pool, amount) in &j.resources {
             match pools_cap.get(pool) {
                 None => {
-                    return Err(Error::Graph(format!(
+                    return Err(Report::new(Error::Graph(format!(
                         "job {:?} requests unknown resource pool {pool:?}",
                         j.id
-                    )))
+                    ))))
                 }
                 Some(cap) if amount > cap => {
-                    return Err(Error::Graph(format!(
+                    return Err(Report::new(Error::Graph(format!(
                         "job {:?} requests {amount} units of pool {pool:?}, capacity is {cap}",
                         j.id
-                    )))
+                    ))))
                 }
                 _ => {}
             }
@@ -344,7 +352,7 @@ fn detect_cycle(jobs: &[JobDef]) -> Result<()> {
         }
     }
     if visited != jobs.len() {
-        return Err(Error::Graph("cycle detected in job graph".to_string()));
+        return Err(Report::new(Error::Graph("cycle detected in job graph".to_string())));
     }
     Ok(())
 }
@@ -685,7 +693,42 @@ fn dispatch_argv_job(
     };
 
     let start_ms = now_ms();
-    let exec_result = shared.executor.run(&prepared)?;
+    // Two distinct failure modes, both routed through `failure.log` + a
+    // structured `FailedJob`: (1) the executor itself errors before/around
+    // running the job (spawn ENOENT, staging I/O, a forkserver template that
+    // never started) — an `Err(Report<Error>)` carrying a `file:line` Rust
+    // context chain; (2) the job ran but exited non-zero — an `Ok` result.
+    let exec_result = match shared.executor.run(&prepared) {
+        Ok(r) => r,
+        Err(report) => {
+            // `{report:?}` renders the full error-stack tree (context chain
+            // with locations + backtrace); color is disabled globally at the
+            // top of `run()` so this stays clean in a file.
+            let rendered = format!("{report:?}");
+            let failure_log = executor::write_failure_log(
+                &log_dir,
+                &job.id,
+                None,
+                Some(&rendered),
+                b"",
+                b"",
+            );
+            let reason = format!(
+                "job {:?} failed to execute (ppg3-core error):\n{}",
+                job.id, rendered
+            );
+            let detail = FailedJob {
+                reason: reason.clone(),
+                log_dir: Some(log_dir.display().to_string()),
+                failure_log: failure_log.map(|p| p.display().to_string()),
+                exit_code: None,
+            };
+            return Ok(JobOutcome::Failed {
+                reason,
+                detail: Some(detail),
+            });
+        }
+    };
     let end_ms = now_ms();
 
     if exec_result.exit_code != 0 {
@@ -695,7 +738,8 @@ fn dispatch_argv_job(
         let failure_log = executor::write_failure_log(
             &log_dir,
             &job.id,
-            exec_result.exit_code,
+            Some(exec_result.exit_code),
+            None,
             &exec_result.stdout,
             &exec_result.stderr,
         );
@@ -745,19 +789,19 @@ fn dispatch_argv_job(
         let actual = match (manifest.content.len(), manifest.content.values().next()) {
             (1, Some(entry)) => &entry.blake3,
             (n, _) => {
-                return Err(Error::JobFailed(format!(
+                return Err(Report::new(Error::JobFailed(format!(
                     "job {:?}: blake3 pin requires exactly one output file, but the \
                      job produced {n}",
                     job.id
-                )));
+                ))));
             }
         };
         if actual != declared {
-            return Err(Error::JobFailed(format!(
+            return Err(Report::new(Error::JobFailed(format!(
                 "job {:?}: declared blake3={declared:?} but the fetched content \
                  hashed to {actual:?}",
                 job.id
-            )));
+            ))));
         }
     }
 
@@ -970,11 +1014,11 @@ fn resolve_placeholder(
             ))
         })?;
         return match r {
-            InputRef::Leaf { .. } => Err(Error::JobFailed(format!(
+            InputRef::Leaf { .. } => Err(Report::new(Error::JobFailed(format!(
                 "job {:?}: {{in:{name}}} refers to a Leaf input (a Params value), \
                  which has no mounted path — read it via io.params instead",
                 job.id
-            ))),
+            )))),
             // A File input is bound directly at /ppg/in/<name> (the file
             // itself), so the placeholder is that path with no filename suffix.
             InputRef::File { .. } => Ok(Some(format!("/ppg/in/{name}"))),
@@ -1004,10 +1048,10 @@ fn resolve_placeholder(
     }
     if let Some(name) = token.strip_prefix("tool:") {
         if !job.tools.contains_key(name) {
-            return Err(Error::JobFailed(format!(
+            return Err(Report::new(Error::JobFailed(format!(
                 "job {:?}: argv references unknown tool {{tool:{name}}}",
                 job.id
-            )));
+            ))));
         }
         return Ok(Some(format!("/ppg/tools/{name}")));
     }
@@ -1089,7 +1133,7 @@ mod tests {
     fn validate_rejects_duplicate_ids() {
         let jobs = vec![argv_job("a", BTreeMap::new()), argv_job("a", BTreeMap::new())];
         assert!(matches!(
-            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()),
+            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()).as_ref().map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1100,7 +1144,7 @@ mod tests {
         inputs.insert("x".to_string(), InputRef::Job { id: "missing".to_string() });
         let jobs = vec![argv_job("a", inputs)];
         assert!(matches!(
-            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()),
+            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()).as_ref().map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1113,7 +1157,7 @@ mod tests {
         i_b.insert("x".to_string(), InputRef::Job { id: "a".to_string() });
         let jobs = vec![argv_job("a", i_a), argv_job("b", i_b)];
         assert!(matches!(
-            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()),
+            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()).as_ref().map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1125,7 +1169,7 @@ mod tests {
         inputs.insert("x".to_string(), InputRef::Job { id: "p".to_string() });
         let consumer = argv_job("c", inputs);
         assert!(matches!(
-            validate_and_index(&[producer, consumer], &HashMap::new(), &BTreeMap::new()),
+            validate_and_index(&[producer, consumer], &HashMap::new(), &BTreeMap::new()).as_ref().map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1137,13 +1181,13 @@ mod tests {
         let mut caps = BTreeMap::new();
         caps.insert("cores".to_string(), 4);
         assert!(matches!(
-            validate_and_index(std::slice::from_ref(&j), &HashMap::new(), &caps),
+            validate_and_index(std::slice::from_ref(&j), &HashMap::new(), &caps).as_ref().map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
         let mut j2 = argv_job("a", BTreeMap::new());
         j2.resources.insert("gpu".to_string(), 1);
         assert!(matches!(
-            validate_and_index(std::slice::from_ref(&j2), &HashMap::new(), &caps),
+            validate_and_index(std::slice::from_ref(&j2), &HashMap::new(), &caps).as_ref().map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1235,7 +1279,7 @@ mod tests {
         inputs.insert("cfg".to_string(), InputRef::Leaf { hash: "deadbeef".to_string() });
         let job = argv_job("a", inputs);
         assert!(matches!(
-            lower_token("{in:cfg}", &job, &HashMap::new()),
+            lower_token("{in:cfg}", &job, &HashMap::new()).as_ref().map_err(|r| r.current_context()),
             Err(Error::JobFailed(_))
         ));
     }
@@ -1286,7 +1330,7 @@ mod tests {
     fn lower_token_unknown_out_named_is_job_failed() {
         let job = argv_job("a", BTreeMap::new());
         assert!(matches!(
-            lower_token("{out:nope}", &job, &HashMap::new()),
+            lower_token("{out:nope}", &job, &HashMap::new()).as_ref().map_err(|r| r.current_context()),
             Err(Error::JobFailed(_))
         ));
     }

@@ -83,6 +83,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use error_stack::{Report, ResultExt as _};
+
 use crate::error::Error;
 use crate::executor::{self, Executor, ExecResult, NoneExecutor, PreparedJob};
 use crate::Result;
@@ -360,7 +362,7 @@ impl TemplateManager {
         crate::hash::blake3_hex(bytes.as_bytes())[..16].to_string()
     }
 
-    fn spawn_template(&self, key: &TemplateKey) -> Result<Arc<Template>> {
+    fn spawn_template(&self, key: &TemplateKey) -> std::result::Result<Arc<Template>, Report<Error>> {
         std::fs::create_dir_all(&self.work_parent).map_err(|e| Error::io(&self.work_parent, e))?;
 
         let mut argv = vec![key.interpreter.clone()];
@@ -404,12 +406,14 @@ impl TemplateManager {
             // `stderr_path`. Inline its tail so the *reason* is visible in the
             // error itself, not just a path the user has to go open.
             let log = std::fs::read(&stderr_path).unwrap_or_default();
-            return Err(Error::Other(format!(
-                "template {:?} exited before printing a ready line\n\
-                 --- template stderr tail (full log: {}) ---\n{}",
+            return Err(Report::new(Error::Other(format!(
+                "template {:?} exited before printing a ready line",
                 argv[0],
-                stderr_path.display(),
-                tail_lines(&log, 20),
+            )))
+            .attach(format!("full template log: {}", stderr_path.display()))
+            .attach(format!(
+                "template stderr tail:\n{}",
+                tail_lines(&log, 20)
             )));
         }
         let ready: Value = serde_json::from_str(first_line.trim()).map_err(|e| {
@@ -426,10 +430,10 @@ impl TemplateManager {
                 .unwrap_or("unknown error");
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Error::Other(format!(
+            return Err(Report::new(Error::Other(format!(
                 "template {:?} failed to start: {err_msg}",
                 argv[0]
-            )));
+            ))));
         }
 
         let stdin = child
@@ -455,7 +459,7 @@ impl TemplateManager {
     /// accidental-temporary-lifetime-extension hazard: it only blocks other
     /// callers wanting the *same* key, never `self.templates` itself, which
     /// is released immediately after the per-key slot is looked up/inserted).
-    fn get_or_spawn(&self, key: &TemplateKey) -> Result<Arc<Template>> {
+    fn get_or_spawn(&self, key: &TemplateKey) -> std::result::Result<Arc<Template>, Report<Error>> {
         let slot_arc = {
             let mut templates = self.templates.lock().unwrap();
             templates
@@ -567,7 +571,10 @@ impl TemplateManager {
         }
     }
 
-    fn run_via_template(&self, job: &PreparedJob) -> Result<ExecResult> {
+    fn run_via_template(
+        &self,
+        job: &PreparedJob,
+    ) -> std::result::Result<ExecResult, Report<Error>> {
         let key = template_key_for(job).ok_or_else(|| {
             Error::Other("forkserver: could not derive a template key (empty argv?)".to_string())
         })?;
@@ -578,7 +585,9 @@ impl TemplateManager {
 
         let mut respawned_once = false;
         loop {
-            let template = self.get_or_spawn(&key)?;
+            let template = self
+                .get_or_spawn(&key)
+                .attach_with(|| format!("forkserver: dispatching job {:?}", job.ik))?;
             match self.dispatch(&template, &staged, &stdout_path, &stderr_path)? {
                 DispatchOutcome::Result(result) => {
                     executor::finish(&staged, result.exit_code == 0);
@@ -588,11 +597,11 @@ impl TemplateManager {
                     self.drop_template(&key, &template);
                     if respawned_once {
                         executor::finish(&staged, false);
-                        return Err(Error::Other(format!(
+                        return Err(Report::new(Error::Other(format!(
                             "forkserver: template for interpreter {:?} died twice while \
                              dispatching job {:?} (respawn did not help)",
                             key.interpreter, job.ik
-                        )));
+                        ))));
                     }
                     respawned_once = true;
                     continue;
@@ -634,7 +643,7 @@ impl ForkserverExecutor {
 }
 
 impl Executor for ForkserverExecutor {
-    fn run(&self, job: &PreparedJob) -> Result<ExecResult> {
+    fn run(&self, job: &PreparedJob) -> std::result::Result<ExecResult, Report<Error>> {
         if !self.manager.is_enabled() || !is_shim_job(job) {
             return self.fallback.run(job);
         }

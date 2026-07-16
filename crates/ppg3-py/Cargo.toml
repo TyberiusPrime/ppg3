@@ -13,3 +13,4 @@ ppg3-core = { path = "../ppg3-core" }
 serde.workspace = true
 serde_json.workspace = true
 pyo3 = { version = "0.23", features = ["extension-module", "abi3", "abi3-py39"] }
+error-stack = "0.8.0"

@@ -235,9 +235,9 @@ impl HostCallbacks for PyHostCallbacks {
                 ))
             })?;
             serde_json::from_str(&json_str).map_err(|e| {
-                ppg3_core::Error::Other(format!(
+                error_stack::Report::new(ppg3_core::Error::Other(format!(
                     "expand_graph_job({job_id:?}) returned invalid JobDef-list JSON: {e}"
-                ))
+                )))
             })
         })
     }

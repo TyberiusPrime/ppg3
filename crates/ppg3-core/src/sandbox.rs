@@ -39,6 +39,8 @@ use std::path::PathBuf;
 #[cfg(not(all(target_os = "linux", feature = "linux-sandbox")))]
 use crate::error::Error;
 #[cfg(not(all(target_os = "linux", feature = "linux-sandbox")))]
+use error_stack::Report;
+#[cfg(not(all(target_os = "linux", feature = "linux-sandbox")))]
 use crate::Result;
 
 /// One bind mount to set up under the new root, relative to it (e.g.
@@ -248,9 +250,9 @@ pub use imp::enter_sandbox;
 
 #[cfg(not(all(target_os = "linux", feature = "linux-sandbox")))]
 pub fn enter_sandbox(_layout: &SandboxLayout) -> Result<()> {
-    Err(Error::Other(
+    Err(Report::new(Error::Other(
         "linux-sandbox feature not enabled".to_string(),
-    ))
+    )))
 }
 
 // The real runtime exercise of `enter_sandbox` lives in
@@ -273,7 +275,7 @@ mod tests {
             allow_network: false,
         };
         let err = enter_sandbox(&layout).unwrap_err();
-        match err {
+        match err.current_context() {
             Error::Other(msg) => assert!(msg.contains("linux-sandbox feature not enabled")),
             other => panic!("unexpected error variant: {other:?}"),
         }

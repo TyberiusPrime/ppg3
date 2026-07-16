@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "py"]
-default-members = ["core", "cli"]
+members = ["crates/ppg3-core", "crates/ppg3-cli", "crates/ppg3-py"]
+default-members = ["crates/ppg3-core", "crates/ppg3-cli"]
 
 [workspace.package]
 version = "0.1.0"

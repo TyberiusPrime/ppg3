@@ -9,7 +9,7 @@ name = "ppg3"
 path = "src/main.rs"
 
 [dependencies]
-ppg3-core = { path = "../core" }
+ppg3-core = { path = "../ppg3-core" }
 serde = { workspace = true }
 serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }

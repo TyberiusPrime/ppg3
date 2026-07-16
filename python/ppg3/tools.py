@@ -145,6 +145,7 @@ class PyEnv:
 
     @classmethod
     def current(cls, preload: Sequence[str] = ()) -> "PyEnv":
+        assert isinstance(preload, (list, tuple)), "preload must be a list or tuple"
         return cls("current", preload=preload, weakly_hermetic=True)
 
     @classmethod

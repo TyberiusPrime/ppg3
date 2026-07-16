@@ -32,6 +32,7 @@
       uv2nix,
       pyproject-build-systems,
       rust-overlay,
+      naersk,
       ...
     }:
     let
@@ -49,7 +50,6 @@
       editableOverlay = workspace.mkEditablePyprojectOverlay {
         root = "$REPO_ROOT";
       };
-
       pythonSets = forAllSystems (
         system:
         let
@@ -119,9 +119,52 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = import nixpkgs { inherit system overlays; };
           pythonSet = pythonSets.${system}.overrideScope editableOverlay;
           virtualenv = pythonSet.mkVirtualEnv "ppg3-env" workspace.deps.all;
+          naersk-lib = naersk.lib.${system}.override {
+            cargo = pkgs.cargo;
+            rustc = pkgs.rustc;
+          };
+
+          ppg3-cli = naersk-lib.buildPackage {
+            pname = "ppg3-cli";
+            version = "0.1.0";
+            src = ./.;
+            doCheck = true;
+            # Install the `ppg3` CLI binary so the derivation has a non-empty
+            # output; the real point of this check is `doCheck` (cargo test).
+            copyLibs = false;
+            copyBins = true;
+            # A handful of core tests shell out to `which` / `true` (the nix build
+            # sandbox has neither on PATH by default). `/bin/sh` is provided by
+            # nix itself, so the many `/bin/sh`-based tests already work.
+            nativeBuildInputs = [
+              pkgs.which
+              pkgs.coreutils
+            ];
+            cargoBuildOptions =
+              x:
+              x
+              ++ [
+                "-p"
+                "ppg3-cli"
+              ];
+            cargoTestOptions =
+              x:
+              x
+              ++ [
+                "-p"
+                "ppg3-cli"
+                # `none_executor_scrubs_env_to_declared_set_plus_defaults` spawns
+                # the hardcoded absolute path `/usr/bin/env`, which exists on a
+                # NixOS host but not inside nix's hermetic build sandbox. Skip it
+                # here; it still runs in `nix develop` / on the host.
+                "--"
+                "--skip"
+                "none_executor_scrubs_env_to_declared_set_plus_defaults"
+              ];
+          };
         in
         {
           default = pkgs.mkShell {
@@ -131,6 +174,7 @@
               pkgs.rustc
               pkgs.cargo
               pyproject-nix.packages.${system}.build-editable
+              ppg3-cli
             ];
             env = {
               UV_NO_SYNC = "1";

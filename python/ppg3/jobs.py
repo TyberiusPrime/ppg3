@@ -549,7 +549,17 @@ class FileJob(Job):
         store: Optional[str] = None,
         name: Optional[str] = None,
     ):
-        if not isinstance(view, dict) or not view:
+        """
+        view   = what files do we track?
+        run    = what do we execute
+        tools  = what's in the sandbox?
+        inputs = upstream jobs
+        env    = environment variables
+        python = Python environment
+        retain = Retain.Default | Retain.Evict | Retain.Pin - GC behaviour.
+
+        """
+        if not isinstance(view, dict):
             raise DefinitionError(
                 "FileJob(view=...) must be a non-empty dict of output-name -> "
                 "view-relative path"

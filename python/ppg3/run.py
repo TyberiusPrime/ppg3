@@ -53,21 +53,45 @@ def _last_meaningful_line(text: str) -> str:
     return lines[-1]
 
 
+def _fmt_duration(ms: Optional[int]) -> str:
+    """Human-friendly wall-clock duration from milliseconds."""
+    if ms is None:
+        return "?"
+    ms = max(0, int(ms))
+    if ms < 1000:
+        return f"{ms}ms"
+    s = ms / 1000.0
+    if s < 60:
+        return f"{s:.0f}s" if s >= 10 else f"{s:.1f}s"
+    m, rem = divmod(int(round(s)), 60)
+    return f"{m}m{rem}s"
+
+
 class RunResult:
     """The outcome of a :func:`run` call. ``.raw`` is the full decoded
     ``RunReport`` JSON (CONTRACT.md's ``built``/``hits``/``failed``/
     ``job_entries``) for anything not surfaced as a dedicated attribute."""
 
-    def __init__(self, report: Dict[str, Any], generation: Optional[int] = None):
+    def __init__(
+        self,
+        report: Dict[str, Any],
+        generation: Optional[int] = None,
+        job_kinds: Optional[Dict[str, str]] = None,
+    ):
         self.built: List[str] = list(report.get("built", []))
         self.hits: List[str] = list(report.get("hits", []))
         self.failed: Dict[str, str] = dict(report.get("failed", {}))
-        # id -> {"reason", "log_dir", "failure_log", "exit_code"} (see the Rust
-        # `FailedJob`); one entry per `failed` key. Empty dict from an older
-        # core that predates the field.
+        # id -> {"reason", "log_dir", "failure_log", "exit_code", "out_dir",
+        # "runtime_ms"} (see the Rust `FailedJob`); one entry per `failed`
+        # key. Empty dict from an older core that predates the field.
         self.failed_details: Dict[str, Dict[str, Any]] = dict(
             report.get("failed_details", {})
         )
+        # id -> job kind ("command"/"file"/"data"/...), so the failure report
+        # can show an exit code only for CommandJobs (a FileJob's exit code is
+        # always 1 and meaningless — its traceback is what matters). Empty
+        # when the graph is unavailable (e.g. constructed straight from raw).
+        self.job_kinds: Dict[str, str] = dict(job_kinds or {})
         self.job_entries: Dict[str, Any] = dict(report.get("job_entries", {}))
         self.generation = generation
         self.raw = report
@@ -78,43 +102,70 @@ class RunResult:
             f"failed={len(self.failed)}, generation={self.generation!r})"
         )
 
+    # Label column width (widest label + colon = "Exception:"); every field
+    # value starts one space past it, so labels and values line up.
+    _LABEL_W = len("Exception:")
+    _WRAP = 80
+
     def format_failures(self) -> str:
-        """Human-readable table of every failed job — name, exit code, and a
-        one-line error summary — followed by the path to each job's
-        consolidated ``failure.log`` (traceback + stdout + stderr). Returned
-        as plain text (no third-party deps); this is what :class:`PPGRunError`
-        renders and what a caller can print directly."""
+        """Human-readable, per-job failure report. One block per failed job
+        (blank line between blocks): ``Job`` / ``Runtime`` / ``Exit`` (only
+        for CommandJobs) / ``Exception`` (wrapped) / ``Log`` / ``Outputs``.
+        Plain text, no third-party deps — what :class:`PPGRunError` renders."""
         names = sorted(self.failed)
         if not names:
             return "no failed jobs"
+        blocks = [self._format_one_failure(name) for name in names]
+        return f"{len(names)} job(s) failed:\n\n" + "\n\n".join(blocks)
 
-        rows = []
-        for name in names:
-            detail = self.failed_details.get(name, {})
-            exit_code = detail.get("exit_code")
-            exit_str = "-" if exit_code is None else str(exit_code)
-            reason = detail.get("reason") or self.failed.get(name, "")
-            rows.append((name, exit_str, _last_meaningful_line(reason)))
+    def _format_one_failure(self, name: str) -> str:
+        detail = self.failed_details.get(name, {})
+        lines: List[str] = []
 
-        job_w = max(len("JOB"), *(len(r[0]) for r in rows))
-        exit_w = max(len("EXIT"), *(len(r[1]) for r in rows))
+        def field(label: str, value: str) -> None:
+            lines.append(f"{(label + ':').ljust(self._LABEL_W)} {value}")
 
-        lines = [f"{len(names)} job(s) failed:", ""]
-        lines.append(f"  {'JOB'.ljust(job_w)}  {'EXIT'.ljust(exit_w)}  ERROR")
-        for name, exit_str, err in rows:
-            lines.append(f"  {name.ljust(job_w)}  {exit_str.ljust(exit_w)}  {err}")
+        field("Job", name)
 
-        logs = [
-            (name, self.failed_details.get(name, {}).get("failure_log"))
-            for name in names
-        ]
-        logs = [(n, p) for n, p in logs if p]
-        if logs:
-            lines.append("")
-            lines.append("Full logs (traceback + stdout + stderr):")
-            for name, path in logs:
-                lines.append(f"  {name}: {path}")
+        runtime_ms = detail.get("runtime_ms")
+        if runtime_ms is not None:
+            field("Runtime", _fmt_duration(runtime_ms))
+
+        # Exit code only for CommandJobs — a FileJob's is always 1 and its
+        # traceback (Exception, below) is the real story.
+        exit_code = detail.get("exit_code")
+        if exit_code is not None and self.job_kinds.get(name) == "command":
+            field("Exit", str(exit_code))
+
+        reason = detail.get("reason") or self.failed.get(name, "")
+        exc = _last_meaningful_line(reason)
+        if exc:
+            self._wrapped_field(lines, "Exception", exc)
+
+        log = detail.get("failure_log") or detail.get("log_dir")
+        if log:
+            field("Log", log)
+
+        out_dir = detail.get("out_dir")
+        if out_dir:
+            field("Outputs", out_dir)
+
         return "\n".join(lines)
+
+    def _wrapped_field(self, lines: List[str], label: str, text: str) -> None:
+        """Append a label/value field whose value is word-wrapped to
+        ``_WRAP`` columns, with continuation lines indented to line up under
+        the value (never breaking long words like paths/identifiers)."""
+        import textwrap
+
+        value_col = self._LABEL_W + 1
+        avail = max(20, self._WRAP - value_col)
+        pieces = textwrap.wrap(
+            text, width=avail, break_long_words=False, break_on_hyphens=False
+        ) or [""]
+        lines.append(f"{(label + ':').ljust(self._LABEL_W)} {pieces[0]}")
+        for cont in pieces[1:]:
+            lines.append(" " * value_col + cont)
 
 
 class PPGRunError(RuntimeError):
@@ -437,8 +488,10 @@ def run(
     _last_run_info["watched_paths"] = graph.watched_paths()
     _last_run_info["report"] = report
 
+    job_kinds = {jid: getattr(j, "kind", None) for jid, j in graph.jobs.items()}
+
     if report.get("failed"):
-        raise PPGRunError(RunResult(report, generation=None))
+        raise PPGRunError(RunResult(report, generation=None, job_kinds=job_kinds))
 
     # §7.6 TOFU: after a successful run, patch (or table-print) the real
     # hash for every FetchJob defined with blake3=None. Purely a
@@ -506,4 +559,4 @@ def run(
         vcs_json,
     )
     _last_run_info["generation"] = generation
-    return RunResult(report, generation=generation)
+    return RunResult(report, generation=generation, job_kinds=job_kinds)

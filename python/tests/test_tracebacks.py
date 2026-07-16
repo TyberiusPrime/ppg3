@@ -95,5 +95,8 @@ def test_format_failures_lists_all(tmp_path):
 
     table = exc_info.value.result.format_failures()
     assert "2 job(s) failed" in table
-    assert "a.txt" in table and "b.txt" in table
-    assert "EXIT" in table and "ERROR" in table
+    # one block per job, keyed by a "Job:" line.
+    assert table.count("Job:") == 2
+    assert "Job:       a.txt" in table and "Job:       b.txt" in table
+    # per-job fields present.
+    assert "Exception:" in table and "Log:" in table and "Outputs:" in table

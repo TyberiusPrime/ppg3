@@ -142,6 +142,13 @@ pub struct FailedJob {
     pub failure_log: Option<String>,
     /// The process exit code, if the job reached the executor.
     pub exit_code: Option<i32>,
+    /// The job's staging output directory (kept on failure for postmortem —
+    /// `Staging` has no `Drop`, so whatever the job managed to write is still
+    /// there). Only set for a job that reached the executor.
+    pub out_dir: Option<String>,
+    /// Wall-clock time the executor spent on the job, in milliseconds. Only
+    /// set for a job that reached the executor.
+    pub runtime_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -639,6 +646,9 @@ fn dispatch_argv_job(
     let write_store = shared.storeset.write_store(job.store_target.as_deref())?;
     let staging = write_store.open_staging()?;
     let out_dir = staging.path().to_path_buf();
+    // Captured for `FailedJob` before `out_dir` is moved into the
+    // `PreparedJob` below — the staging dir survives a failure (postmortem).
+    let out_dir_str = out_dir.display().to_string();
     let log_dir = write_store.log_dir_for(ik)?;
 
     let mut input_mounts = Vec::new();
@@ -722,6 +732,8 @@ fn dispatch_argv_job(
                 log_dir: Some(log_dir.display().to_string()),
                 failure_log: failure_log.map(|p| p.display().to_string()),
                 exit_code: None,
+                out_dir: Some(out_dir_str.clone()),
+                runtime_ms: Some(now_ms() - start_ms),
             };
             return Ok(JobOutcome::Failed {
                 reason,
@@ -754,6 +766,8 @@ fn dispatch_argv_job(
             log_dir: Some(log_dir.display().to_string()),
             failure_log: failure_log.map(|p| p.display().to_string()),
             exit_code: Some(exec_result.exit_code),
+            out_dir: Some(out_dir_str.clone()),
+            runtime_ms: Some(end_ms - start_ms),
         };
         return Ok(JobOutcome::Failed {
             reason,
@@ -1096,6 +1110,7 @@ fn now_ms() -> i64 {
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
+        .or_else(|_| std::env::var("NICE_HOSTNAME"))
         .unwrap_or_else(|_| "host".to_string())
 }
 

@@ -183,7 +183,7 @@ fn template_spawn_env() -> BTreeMap<String, String> {
     env.insert("TZ".to_string(), "UTC".to_string());
     env.insert("LC_ALL".to_string(), "C.UTF-8".to_string());
     env.insert("SOURCE_DATE_EPOCH".to_string(), "0".to_string());
-    for var in ["PATH", "PYTHONPATH", "VIRTUAL_ENV"] {
+    for var in ["PATH", "PYTHONPATH", "VIRTUAL_ENV", "REPO_ROOT"] {
         if let Ok(v) = std::env::var(var) {
             env.insert(var.to_string(), v);
         }

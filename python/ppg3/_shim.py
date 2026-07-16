@@ -85,6 +85,33 @@ class ShimError(RuntimeError):
     pass
 
 
+def _register_source(filename: str, source: str) -> None:
+    """Pin ``source`` in :mod:`linecache` under ``filename`` so tracebacks
+    can render the real code lines for a callback that has no file on disk
+    (source-mode) or whose file may vanish (opaque ``Source``). Best-effort —
+    never fatal to the job."""
+    try:
+        import linecache
+
+        lines = source.splitlines(keepends=True)
+        linecache.cache[filename] = (len(source), None, lines, filename)
+    except Exception:
+        pass
+
+
+def _print_failure(file) -> None:
+    """Write a rich traceback (source context + locals) for the exception
+    currently being handled to ``file``, falling back to the stdlib
+    traceback if the rich formatter is unavailable/errors — a job's real
+    error must always be reported."""
+    try:
+        from . import _traceback
+
+        file.write(_traceback.format_exc(include_locals=True))
+    except Exception:
+        traceback.print_exc(file=file)
+
+
 def _reconstruct_callback(transport: Dict[str, Any]):
     kind = transport.get("mode")
     if kind == "cloudpickle":
@@ -96,8 +123,13 @@ def _reconstruct_callback(transport: Dict[str, Any]):
     if kind == "source":
         source = transport["source"]
         name = transport["name"]
+        filename = f"<ppg3-source:{name}>"
+        # Register the shipped source under its synthetic compile filename so
+        # a failure traceback (rich or stdlib) can show the real offending
+        # line — there is no file on disk for the linecache/inspect to find.
+        _register_source(filename, source)
         ns: Dict[str, Any] = {"__name__": "ppg3_job_module"}
-        code = compile(source, f"<ppg3-source:{name}>", "exec")
+        code = compile(source, filename, "exec")
         exec(code, ns)
         fn = ns.get(name)
         if fn is None:
@@ -113,6 +145,10 @@ def _reconstruct_callback(transport: Dict[str, Any]):
         qualname = transport["qualname"]
         with open(path, "r", encoding="utf-8") as fh:
             src = fh.read()
+        # `path` is a real file, but register it too: the opaque `Source(...)`
+        # file may be evicted/renamed by the store by the time a traceback is
+        # rendered, so pin its bytes now.
+        _register_source(path, src)
         ns = {"__name__": "ppg3_job_module"}
         code = compile(src, path, "exec")
         exec(code, ns)
@@ -320,7 +356,7 @@ def main(argv=None) -> int:
             sys.stderr.write(f"ppg3._shim: unknown mode {mode!r}\n")
             return 1
     except Exception:
-        traceback.print_exc(file=sys.stderr)
+        _print_failure(sys.stderr)
         return 1
 
 

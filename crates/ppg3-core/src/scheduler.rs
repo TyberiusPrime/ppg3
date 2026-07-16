@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::canon;
 use crate::error::Error;
-use crate::executor::{Executor, Mount, PreparedJob};
+use crate::executor::{self, Executor, Mount, PreparedJob};
 use crate::lease::Lease;
 use crate::manifest::{BuiltInfo, ContentMap};
 use crate::resources::Pools;
@@ -123,11 +123,32 @@ pub trait HostCallbacks: Send + Sync {
     fn run_in_process(&self, job_id: &str, key_doc: &Value) -> Result<()>;
 }
 
+/// Structured detail for one failed job, surfaced to the Python side so
+/// `PPGRunError` can render a table and point at a consolidated log. Present
+/// for *every* entry in `RunReport.failed` (the `reason` mirrors that map's
+/// value); the path/`exit_code` fields are only populated for a job that
+/// actually reached the executor (an upstream-cascade or key-derivation
+/// failure has no process, so they stay `None`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FailedJob {
+    /// Same string as `RunReport.failed[id]` (short reason + stderr tail).
+    pub reason: String,
+    /// The job's per-run log directory, if it got far enough to have one.
+    pub log_dir: Option<String>,
+    /// Path to the consolidated `<log_dir>/failure.log` (traceback + stdout
+    /// + stderr), if it was written.
+    pub failure_log: Option<String>,
+    /// The process exit code, if the job reached the executor.
+    pub exit_code: Option<i32>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunReport {
     pub built: Vec<String>,
     pub hits: Vec<String>,
     pub failed: BTreeMap<String, String>,
+    /// id -> structured failure detail, one entry per `failed` key.
+    pub failed_details: BTreeMap<String, FailedJob>,
     /// id -> (ik, oh), for every non-`InProcess` job (hit or built).
     pub job_entries: BTreeMap<String, (String, String)>,
 }
@@ -405,7 +426,7 @@ fn insert_job(state: &mut State, job: JobDef) {
     state.status.insert(id.clone(), Status::Pending);
     state.total_jobs += 1;
     if let Some(fp) = failed_parent {
-        fail_job(state, &id, format!("upstream failed: {fp}"));
+        fail_job(state, &id, format!("upstream failed: {fp}"), None);
     } else if remaining == 0 {
         mark_ready_if_pending(state, &id);
     }
@@ -441,18 +462,27 @@ fn complete_success(state: &mut State, id: &str) {
 /// will report their own outcome normally (their *own* dependents, if any,
 /// still get the cascade once they finish, via the normal completion path
 /// — or immediately here if they too are still Pending/Ready).
-fn fail_job(state: &mut State, id: &str, reason: String) {
+fn fail_job(state: &mut State, id: &str, reason: String, detail: Option<FailedJob>) {
     if matches!(state.status.get(id), Some(Status::Done) | Some(Status::Failed)) {
         return;
     }
     state.status.insert(id.to_string(), Status::Failed);
+    // Always record a structured detail alongside the string reason (one
+    // `failed_details` entry per `failed` key) — synthesize a bare one from
+    // `reason` when the caller has no process detail (upstream cascade, key
+    // derivation, in-process callback).
+    let detail = detail.unwrap_or_else(|| FailedJob {
+        reason: reason.clone(),
+        ..FailedJob::default()
+    });
     state.report.failed.insert(id.to_string(), reason);
+    state.report.failed_details.insert(id.to_string(), detail);
     state.terminal += 1;
     state.ready.retain(|x| x != id);
     if let Some(children) = state.dependents.get(id).cloned() {
         for c in children {
             if matches!(state.status.get(&c), Some(Status::Pending) | Some(Status::Ready)) {
-                fail_job(state, &c, format!("upstream failed: {id}"));
+                fail_job(state, &c, format!("upstream failed: {id}"), None);
             }
         }
     }
@@ -515,7 +545,24 @@ enum JobOutcome {
     },
     InProcessDone,
     GraphExpanded(Vec<JobDef>),
-    Failed(String),
+    Failed {
+        reason: String,
+        /// Structured detail for jobs that reached the executor (log paths,
+        /// exit code); `None` for key-derivation / callback-dispatch failures
+        /// that never spawned a process.
+        detail: Option<FailedJob>,
+    },
+}
+
+impl JobOutcome {
+    /// Convenience for the common "failed with just a reason string, no
+    /// process detail" case.
+    fn failed(reason: impl Into<String>) -> JobOutcome {
+        JobOutcome::Failed {
+            reason: reason.into(),
+            detail: None,
+        }
+    }
 }
 
 /// Runs entirely outside the state lock — store I/O, executor spawn, and
@@ -534,25 +581,25 @@ fn dispatch_job(shared: &Shared, id: &str) -> JobOutcome {
     if job.graph_job {
         return match shared.callbacks.expand_graph_job(id) {
             Ok(new_jobs) => JobOutcome::GraphExpanded(new_jobs),
-            Err(e) => JobOutcome::Failed(format!("expand_graph_job({id:?}) failed: {e}")),
+            Err(e) => JobOutcome::failed(format!("expand_graph_job({id:?}) failed: {e}")),
         };
     }
 
     let (key_doc, ik) = match derive_key(&job, &completed_snapshot) {
         Ok(v) => v,
-        Err(msg) => return JobOutcome::Failed(msg),
+        Err(msg) => return JobOutcome::failed(msg),
     };
 
     if matches!(job.exec_template, ExecTemplate::InProcess) {
         return match shared.callbacks.run_in_process(id, &key_doc) {
             Ok(()) => JobOutcome::InProcessDone,
-            Err(e) => JobOutcome::Failed(format!("run_in_process({id:?}) failed: {e}")),
+            Err(e) => JobOutcome::failed(format!("run_in_process({id:?}) failed: {e}")),
         };
     }
 
     match dispatch_argv_job(shared, &job, &ik, &key_doc, &completed_snapshot) {
         Ok(outcome) => outcome,
-        Err(e) => JobOutcome::Failed(e.to_string()),
+        Err(e) => JobOutcome::failed(e.to_string()),
     }
 }
 
@@ -631,7 +678,7 @@ fn dispatch_argv_job(
         inputs: input_mounts,
         tools: tool_mounts,
         out_dir,
-        log_dir,
+        log_dir: log_dir.clone(),
         allow_network,
         cwd_out: true,
         runtime: Some(job.runtime.clone()),
@@ -642,12 +689,32 @@ fn dispatch_argv_job(
     let end_ms = now_ms();
 
     if exec_result.exit_code != 0 {
-        return Err(Error::JobFailed(format!(
+        // Consolidate traceback + stdout + stderr into a single log the user
+        // can open, and hand the path back as structured detail so the
+        // Python side can tabulate the failure and point at it.
+        let failure_log = executor::write_failure_log(
+            &log_dir,
+            &job.id,
+            exec_result.exit_code,
+            &exec_result.stdout,
+            &exec_result.stderr,
+        );
+        let reason = format!(
             "job {:?} exited with code {}\n--- stderr tail ---\n{}",
             job.id,
             exec_result.exit_code,
             stderr_tail(&exec_result.stderr)
-        )));
+        );
+        let detail = FailedJob {
+            reason: reason.clone(),
+            log_dir: Some(log_dir.display().to_string()),
+            failure_log: failure_log.map(|p| p.display().to_string()),
+            exit_code: Some(exec_result.exit_code),
+        };
+        return Ok(JobOutcome::Failed {
+            reason,
+            detail: Some(detail),
+        });
     }
 
     let built = BuiltInfo {
@@ -750,12 +817,12 @@ fn apply_outcome(shared: &Shared, state: &mut State, id: &str, outcome: JobOutco
                     complete_success(state, id);
                 }
                 Err(e) => {
-                    fail_job(state, id, format!("graph_job expansion invalid: {e}"));
+                    fail_job(state, id, format!("graph_job expansion invalid: {e}"), None);
                 }
             }
         }
-        JobOutcome::Failed(reason) => {
-            fail_job(state, id, reason);
+        JobOutcome::Failed { reason, detail } => {
+            fail_job(state, id, reason, detail);
         }
     }
 }

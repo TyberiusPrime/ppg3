@@ -19,13 +19,13 @@
 //! ## Deviation from the CONTRACT.md doc-comment for `NoneExecutor`
 //!
 //! The one-line CONTRACT.md sketch for `NoneExecutor` mentions a `PPG_ROOT`
-//! env var pointing at the staged root. The work-package brief for this
-//! agent is explicit and more specific: "sets env exactly to job.env plus
-//! TMPDIR/HOME ... don't invent extra vars beyond TMPDIR/HOME defaults" —
-//! precisely so that an "env scrub" integration test (run `env` inside the
-//! job, snapshot it, assert it is *exactly* the declared set) is
-//! meaningful. Adding `PPG_ROOT` would break that invariant for no
-//! contract-mandated reason, so it is omitted here. See STATUS.md.
+//! env var pointing at the staged root; that specific var is still omitted
+//! (nothing consumes it). The env the child sees is the job's scrubbed env
+//! (`job.env` + `TMPDIR`/`HOME` defaults) plus the weakly-hermetic bootstrap
+//! pass-through ([`BOOTSTRAP_PASSTHROUGH_VARS`]) — the *same* list the
+//! forkserver template carries, so a cold `python -m ppg3._shim` can import
+//! `ppg3` in an editable/dev or nix-resolved install. The env-scrub test
+//! asserts nothing *beyond* that allowed set leaks. See STATUS.md.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -236,6 +236,36 @@ pub(crate) fn stage(job: &PreparedJob, work_parent: &Path) -> Result<StagedJob> 
     })
 }
 
+/// Env vars passed through from the coordinator's *own* process env to a
+/// job worker so a fresh interpreter can bootstrap the `ppg3` package before
+/// the job's scrubbed env otherwise takes over: an editable/dev install
+/// resolves `ppg3` via a `.pth` that expands `$REPO_ROOT`, and a
+/// nix-resolved `PyEnv` needs its interpreter's own shared libs reachable
+/// via `PATH`. Without these a cold `python -I -m ppg3._shim` dies with
+/// `No module named 'ppg3'`.
+///
+/// **Single source of truth** for the weakly-hermetic bootstrap pass-through
+/// shared by the cold-exec ([`NoneExecutor`]) path and the forkserver
+/// template ([`crate::forkserver`]) — hermeticity here is enforced by
+/// review, not the kernel (see STATUS.md "forkserver template env wart").
+/// The sandboxed [`BwrapExecutor`] deliberately does **not** get these: it
+/// stages a real nix closure instead.
+pub(crate) const BOOTSTRAP_PASSTHROUGH_VARS: [&str; 4] =
+    ["PATH", "PYTHONPATH", "VIRTUAL_ENV", "REPO_ROOTA"];
+
+/// The subset of [`BOOTSTRAP_PASSTHROUGH_VARS`] actually set in the
+/// coordinator's process env, ready to overlay a job's env *under* (the job
+/// / §6.1a baseline always wins on conflict).
+pub(crate) fn bootstrap_passthrough_env() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for var in BOOTSTRAP_PASSTHROUGH_VARS {
+        if let Ok(v) = std::env::var(var) {
+            env.insert(var.to_string(), v);
+        }
+    }
+    env
+}
+
 /// Post-run cleanup: remove the staged work dir on success, keep it (for
 /// postmortem) on failure. Mirrors `NoneExecutor`'s original behavior
 /// exactly.
@@ -270,11 +300,19 @@ impl Executor for NoneExecutor {
             return Err(Error::Other("PreparedJob.argv is empty".to_string()));
         }
 
+        // Weakly-hermetic bootstrap pass-through (shared with the forkserver
+        // template — see `bootstrap_passthrough_env`) so a cold
+        // `python -m ppg3._shim` can import `ppg3`; the job's scrubbed env is
+        // overlaid on top so anything it (or the §6.1a baseline) set
+        // explicitly always wins.
+        let mut env = bootstrap_passthrough_env();
+        env.extend(staged.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
         let mut cmd = Command::new(&staged.argv[0]);
         cmd.args(&staged.argv[1..])
             .current_dir(&staged.cwd)
             .env_clear()
-            .envs(&staged.env)
+            .envs(&env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -318,6 +356,43 @@ fn write_log_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = std::fs::File::create(path).map_err(|e| Error::io(path, e))?;
     f.write_all(bytes).map_err(|e| Error::io(path, e))?;
     Ok(())
+}
+
+/// Write a single consolidated `<log_dir>/failure.log` for a failed job:
+/// a header (job id + exit code), then the captured stderr (which for a
+/// python job already carries the rich traceback produced by `ppg3._shim`/
+/// `ppg3._template`), then the captured stdout. Returns the path so the
+/// scheduler can surface it in `RunReport.failed_details`. Shared by the
+/// cold-exec ([`NoneExecutor`]) and forkserver paths. Best-effort: a write
+/// error is not fatal to reporting the failure itself (the caller still has
+/// the in-memory stderr), so it is logged-and-swallowed by returning `None`
+/// on error.
+pub(crate) fn write_failure_log(
+    log_dir: &Path,
+    job_id: &str,
+    exit_code: i32,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<PathBuf> {
+    let path = log_dir.join("failure.log");
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = writeln!(buf, "ppg3 job failed: {job_id}");
+    let _ = writeln!(buf, "exit code: {exit_code}");
+    let _ = writeln!(buf);
+    let _ = writeln!(buf, "=== traceback / stderr ===");
+    buf.extend_from_slice(stderr);
+    if !stderr.ends_with(b"\n") {
+        buf.push(b'\n');
+    }
+    let _ = writeln!(buf, "=== stdout ===");
+    buf.extend_from_slice(stdout);
+    if !stdout.ends_with(b"\n") {
+        buf.push(b'\n');
+    }
+    match std::fs::File::create(&path).and_then(|mut f| f.write_all(&buf)) {
+        Ok(()) => Some(path),
+        Err(_) => None,
+    }
 }
 
 // =============================================================== bwrap
@@ -876,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn none_executor_scrubs_env_to_declared_set_plus_defaults() {
+    fn none_executor_scrubs_env_to_declared_set_plus_defaults_and_bootstrap() {
         let parent = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let log = tempfile::tempdir().unwrap();
@@ -899,9 +974,17 @@ mod tests {
         assert_eq!(seen.get("MY_VAR").map(String::as_str), Some("hello"));
         assert!(seen.contains_key("TMPDIR"));
         assert!(seen.contains_key("HOME"));
-        // exactly declared + TMPDIR + HOME - nothing leaked from the host
-        // process' own environment (e.g. no inherited PATH unless declared).
-        assert_eq!(seen.len(), 3, "unexpected leaked env vars: {seen:?}");
+        // Declared var + TMPDIR/HOME defaults + the weakly-hermetic bootstrap
+        // pass-through (only whichever of PATH/PYTHONPATH/VIRTUAL_ENV/REPO_ROOT
+        // are set in this process). Nothing *else* from the coordinator's own
+        // (large) environment may leak through env_clear.
+        let mut allowed: Vec<String> = ["MY_VAR", "TMPDIR", "HOME"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        allowed.extend(bootstrap_passthrough_env().into_keys());
+        let leaked: Vec<&String> = seen.keys().filter(|k| !allowed.contains(k)).collect();
+        assert!(leaked.is_empty(), "unexpected leaked env vars: {leaked:?}");
     }
 
     #[test]

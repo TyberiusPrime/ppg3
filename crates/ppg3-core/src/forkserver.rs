@@ -154,6 +154,15 @@ fn warn_once() {
     });
 }
 
+/// Last `n` lines of `bytes` as a lossy UTF-8 string — used to inline a
+/// dead template's stderr tail into the dispatch error.
+fn tail_lines(bytes: &[u8], n: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_id() -> String {
@@ -168,14 +177,13 @@ fn unique_id() -> String {
 /// The template's *own* process env (not the job's — that travels inside
 /// the "run" message and is applied by the template's forked child). A
 /// scrubbed baseline (§6.1a: `HOME`/`TMPDIR`/`TZ`/`LC_ALL`/
-/// `SOURCE_DATE_EPOCH`) plus a pragmatic, **weakly-hermetic** pass-through
-/// of `PATH`/`PYTHONPATH`/`VIRTUAL_ENV` from the coordinator's own process
-/// env so the template can actually import the `ppg3` package (and, for a
-/// nix-resolved `PyEnv`, find its own interpreter's shared libs). This is a
-/// deliberate wart, not an oversight — see STATUS.md "forkserver template
-/// env wart": hermeticity here is enforced by review, not the kernel;
-/// that's the `linux-sandbox`/userns future, out of scope per this work
-/// package's scope constraint.
+/// `SOURCE_DATE_EPOCH`) plus the pragmatic, **weakly-hermetic** bootstrap
+/// pass-through (`PATH`/`PYTHONPATH`/`VIRTUAL_ENV`/`REPO_ROOT`) from the
+/// coordinator's own process env so the template can actually import the
+/// `ppg3` package (and, for a nix-resolved `PyEnv`, find its own
+/// interpreter's shared libs). The pass-through list is shared with the
+/// cold-exec path — see [`crate::executor::bootstrap_passthrough_env`] /
+/// STATUS.md "forkserver template env wart".
 fn template_spawn_env() -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("HOME".to_string(), "/tmp".to_string());
@@ -183,11 +191,7 @@ fn template_spawn_env() -> BTreeMap<String, String> {
     env.insert("TZ".to_string(), "UTC".to_string());
     env.insert("LC_ALL".to_string(), "C.UTF-8".to_string());
     env.insert("SOURCE_DATE_EPOCH".to_string(), "0".to_string());
-    for var in ["PATH", "PYTHONPATH", "VIRTUAL_ENV", "REPO_ROOT"] {
-        if let Ok(v) = std::env::var(var) {
-            env.insert(var.to_string(), v);
-        }
-    }
+    env.extend(executor::bootstrap_passthrough_env());
     env
 }
 
@@ -395,10 +399,17 @@ impl TemplateManager {
         if read == 0 || first_line.trim().is_empty() {
             let _ = child.kill();
             let _ = child.wait();
+            // The template's own stderr (its startup traceback — e.g. a
+            // preload `ImportError`, or `No module named 'ppg3'`) went to
+            // `stderr_path`. Inline its tail so the *reason* is visible in the
+            // error itself, not just a path the user has to go open.
+            let log = std::fs::read(&stderr_path).unwrap_or_default();
             return Err(Error::Other(format!(
-                "template {:?} exited before printing a ready line (see {})",
+                "template {:?} exited before printing a ready line\n\
+                 --- template stderr tail (full log: {}) ---\n{}",
                 argv[0],
-                stderr_path.display()
+                stderr_path.display(),
+                tail_lines(&log, 20),
             )));
         }
         let ready: Value = serde_json::from_str(first_line.trim()).map_err(|e| {

@@ -20,6 +20,19 @@ from .io import JobIO
 from .jobs import File, Graph, GraphJob, Params, UnsandboxedJob
 
 
+def _last_meaningful_line(text: str) -> str:
+    """A one-line error summary from a reason/traceback blob: the final
+    exception line if we can find one (our rich formatter's ``Exception: …``
+    or a trailing ``Type: value``), else the last non-empty line."""
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    for ln in reversed(lines):
+        if ln.startswith("Exception: "):
+            return ln[len("Exception: "):].strip()
+    return lines[-1].strip()
+
+
 class RunResult:
     """The outcome of a :func:`run` call. ``.raw`` is the full decoded
     ``RunReport`` JSON (CONTRACT.md's ``built``/``hits``/``failed``/
@@ -29,6 +42,12 @@ class RunResult:
         self.built: List[str] = list(report.get("built", []))
         self.hits: List[str] = list(report.get("hits", []))
         self.failed: Dict[str, str] = dict(report.get("failed", {}))
+        # id -> {"reason", "log_dir", "failure_log", "exit_code"} (see the Rust
+        # `FailedJob`); one entry per `failed` key. Empty dict from an older
+        # core that predates the field.
+        self.failed_details: Dict[str, Dict[str, Any]] = dict(
+            report.get("failed_details", {})
+        )
         self.job_entries: Dict[str, Any] = dict(report.get("job_entries", {}))
         self.generation = generation
         self.raw = report
@@ -39,6 +58,44 @@ class RunResult:
             f"failed={len(self.failed)}, generation={self.generation!r})"
         )
 
+    def format_failures(self) -> str:
+        """Human-readable table of every failed job — name, exit code, and a
+        one-line error summary — followed by the path to each job's
+        consolidated ``failure.log`` (traceback + stdout + stderr). Returned
+        as plain text (no third-party deps); this is what :class:`PPGRunError`
+        renders and what a caller can print directly."""
+        names = sorted(self.failed)
+        if not names:
+            return "no failed jobs"
+
+        rows = []
+        for name in names:
+            detail = self.failed_details.get(name, {})
+            exit_code = detail.get("exit_code")
+            exit_str = "-" if exit_code is None else str(exit_code)
+            reason = detail.get("reason") or self.failed.get(name, "")
+            rows.append((name, exit_str, _last_meaningful_line(reason)))
+
+        job_w = max(len("JOB"), *(len(r[0]) for r in rows))
+        exit_w = max(len("EXIT"), *(len(r[1]) for r in rows))
+
+        lines = [f"{len(names)} job(s) failed:", ""]
+        lines.append(f"  {'JOB'.ljust(job_w)}  {'EXIT'.ljust(exit_w)}  ERROR")
+        for name, exit_str, err in rows:
+            lines.append(f"  {name.ljust(job_w)}  {exit_str.ljust(exit_w)}  {err}")
+
+        logs = [
+            (name, self.failed_details.get(name, {}).get("failure_log"))
+            for name in names
+        ]
+        logs = [(n, p) for n, p in logs if p]
+        if logs:
+            lines.append("")
+            lines.append("Full logs (traceback + stdout + stderr):")
+            for name, path in logs:
+                lines.append(f"  {name}: {path}")
+        return "\n".join(lines)
+
 
 class PPGRunError(RuntimeError):
     """Raised by :func:`run` when ``report.failed`` is non-empty. The view
@@ -48,10 +105,7 @@ class PPGRunError(RuntimeError):
     callers can inspect what broke."""
 
     def __init__(self, result: RunResult):
-        names = sorted(result.failed)
-        preview = ", ".join(f"{n!r}: {result.failed[n]}" for n in names[:5])
-        more = f" (+{len(names) - 5} more)" if len(names) > 5 else ""
-        super().__init__(f"ppg3 run: {len(result.failed)} job(s) failed: {preview}{more}")
+        super().__init__("ppg3 run failed:\n" + result.format_failures())
         self.result = result
 
 

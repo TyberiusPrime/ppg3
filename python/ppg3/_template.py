@@ -141,7 +141,15 @@ def _run_child(run: Dict[str, Any]) -> None:
     except SystemExit as e:
         rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     except Exception:
-        traceback.print_exc(file=sys.stderr)
+        # Failures *outside* `_shim.main` (chdir/env/import) — give them the
+        # same rich traceback the shim gives callback failures, with the
+        # stdlib traceback as a hard fallback.
+        try:
+            from ppg3 import _shim
+
+            _shim._print_failure(sys.stderr)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
         rc = 1
     os._exit(rc)
 

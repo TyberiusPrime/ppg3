@@ -1,6 +1,6 @@
 """Rich, self-contained traceback formatting for ppg3 job failures.
 
-Adapted from ppg2's ``test/ppg_traceback.py`` (itself borrowed from
+Adapted from ppg2's ``ppg_traceback.py`` (itself borrowed from
 ``rich``, Copyright 2020 Will McGugan, Florian Finkernagel), with the sole
 behavioural change that it is **stdlib-only**: the ``rich.markup.escape``
 dependency is dropped (job workers — ``ppg3._shim`` / ``ppg3._template`` —
@@ -170,6 +170,9 @@ class Trace:
             out.append("Traceback (most recent call last):")
 
             for frame in stack.frames:
+                if 'ppg3/_shim.py' in frame.filename:
+                    out.append(f'{frame.filename}":{frame.lineno}, in {frame.name} (details skipped)')
+                    continue
                 out.append(f"  {frame.filename}:{frame.lineno}, in {frame.name}")
                 if frame.source:
                     code = frame.source.split("\n")

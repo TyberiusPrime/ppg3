@@ -213,6 +213,71 @@ pub fn read_generation_meta(project_dir: &Path, n: u64) -> Result<GenMeta, Error
     read_meta(&generation_dir(project_dir, n))
 }
 
+/// What [`materialize`] did — for CLI/JSON reporting.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MaterializeReport {
+    pub generation: u64,
+    pub dest: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Copy a generation's view tree into `dest` as real, *writable* files,
+/// dereferencing the store symlinks — the answer to "give me a plain folder
+/// I can hand off / edit / archive, not a tree of symlinks into a read-only
+/// store". `generation` defaults to the current one. `dest` must not already
+/// exist (we never merge into or clobber an existing path).
+pub fn materialize(
+    project_dir: &Path,
+    generation: Option<u64>,
+    dest: &Path,
+) -> Result<MaterializeReport, Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project_dir = fs::canonicalize(project_dir).map_err(|e| Error::io(project_dir, e))?;
+    let n = match generation {
+        Some(n) => n,
+        None => current_generation_number(&project_dir)?
+            .ok_or_else(|| Error::Other("no current generation to materialize".to_string()))?,
+    };
+    let gen_dir = generation_dir(&project_dir, n);
+    if !gen_dir.is_dir() {
+        return Err(Error::Other(format!("generation {n} does not exist")));
+    }
+    if dest.exists() {
+        return Err(Error::Other(format!(
+            "destination {dest:?} already exists; choose a path that does not yet exist"
+        )));
+    }
+    let meta = read_meta(&gen_dir)?;
+
+    fs::create_dir_all(dest).map_err(|e| Error::io(dest, e))?;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for e in &meta.entries {
+        // The view symlink resolves (through `current`-independent relative
+        // links) to the real store file; canonicalize dereferences it.
+        let link = gen_dir.join(&e.view_rel_path);
+        let real = fs::canonicalize(&link).map_err(|e2| Error::io(&link, e2))?;
+        let out_path = dest.join(&e.view_rel_path);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(|e2| Error::io(parent, e2))?;
+        }
+        let n_bytes = fs::copy(&real, &out_path).map_err(|e2| Error::io(&out_path, e2))?;
+        // Store entries are 0444; a materialized copy is meant to be edited.
+        fs::set_permissions(&out_path, fs::Permissions::from_mode(0o644))
+            .map_err(|e2| Error::io(&out_path, e2))?;
+        bytes += n_bytes;
+        files += 1;
+    }
+    Ok(MaterializeReport {
+        generation: n,
+        dest: dest.to_path_buf(),
+        files,
+        bytes,
+    })
+}
+
 fn next_generation_number(vdir: &Path) -> Result<u64, Error> {
     let mut max = 0u64;
     if vdir.is_dir() {

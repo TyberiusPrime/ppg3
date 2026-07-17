@@ -76,32 +76,61 @@ impl MockExecutor {
         let mut s = self.state.lock().unwrap();
         s.outputs.insert(
             job_id.to_string(),
-            files.iter().map(|(p, c)| (p.to_string(), c.to_vec())).collect(),
+            files
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.to_vec()))
+                .collect(),
         );
     }
 
     fn set_exit_code(&self, job_id: &str, code: i32) {
-        self.state.lock().unwrap().exit_codes.insert(job_id.to_string(), code);
+        self.state
+            .lock()
+            .unwrap()
+            .exit_codes
+            .insert(job_id.to_string(), code);
     }
 
     fn set_error(&self, job_id: &str, msg: &str) {
-        self.state.lock().unwrap().errors.insert(job_id.to_string(), msg.to_string());
+        self.state
+            .lock()
+            .unwrap()
+            .errors
+            .insert(job_id.to_string(), msg.to_string());
     }
 
     fn set_delay(&self, job_id: &str, dur: Duration) {
-        self.state.lock().unwrap().delays.insert(job_id.to_string(), dur);
+        self.state
+            .lock()
+            .unwrap()
+            .delays
+            .insert(job_id.to_string(), dur);
     }
 
     fn set_barrier(&self, job_id: &str, barrier: Arc<Barrier>) {
-        self.state.lock().unwrap().barriers.insert(job_id.to_string(), barrier);
+        self.state
+            .lock()
+            .unwrap()
+            .barriers
+            .insert(job_id.to_string(), barrier);
     }
 
     fn set_abort_on(&self, job_id: &str, flag: Arc<AtomicBool>) {
-        self.state.lock().unwrap().abort_on.insert(job_id.to_string(), flag);
+        self.state
+            .lock()
+            .unwrap()
+            .abort_on
+            .insert(job_id.to_string(), flag);
     }
 
     fn count(&self, job_id: &str) -> usize {
-        self.state.lock().unwrap().invocations.iter().filter(|i| i.as_str() == job_id).count()
+        self.state
+            .lock()
+            .unwrap()
+            .invocations
+            .iter()
+            .filter(|i| i.as_str() == job_id)
+            .count()
     }
 
     fn total_invocations(&self) -> usize {
@@ -122,11 +151,12 @@ impl Executor for MockExecutor {
         &self,
         job: &PreparedJob,
     ) -> std::result::Result<ExecResult, error_stack::Report<Error>> {
-        let job_id = job
-            .argv
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| panic!("MockExecutor expects argv = [\"mock\", <job-id>], got {:?}", job.argv));
+        let job_id = job.argv.get(1).cloned().unwrap_or_else(|| {
+            panic!(
+                "MockExecutor expects argv = [\"mock\", <job-id>], got {:?}",
+                job.argv
+            )
+        });
 
         // Executor-level failure injection (the scheduler's `Err` branch):
         // fail before recording an invocation, mirroring a real spawn error.
@@ -157,7 +187,14 @@ impl Executor for MockExecutor {
 
         self.active.fetch_sub(1, Ordering::SeqCst);
 
-        let exit_code = self.state.lock().unwrap().exit_codes.get(&job_id).copied().unwrap_or(0);
+        let exit_code = self
+            .state
+            .lock()
+            .unwrap()
+            .exit_codes
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0);
 
         if exit_code == 0 {
             let files = self.state.lock().unwrap().outputs.get(&job_id).cloned();
@@ -208,7 +245,10 @@ impl TestCallbacks {
     }
 
     fn set_expansion(&self, job_id: &str, jobs: Vec<JobDef>) {
-        self.expansions.lock().unwrap().insert(job_id.to_string(), jobs);
+        self.expansions
+            .lock()
+            .unwrap()
+            .insert(job_id.to_string(), jobs);
     }
 
     fn run_in_process_call_count(&self) -> usize {
@@ -231,7 +271,10 @@ impl HostCallbacks for TestCallbacks {
     }
 
     fn run_in_process(&self, job_id: &str, key_doc: &Value) -> ppg3_core::Result<()> {
-        self.run_in_process_calls.lock().unwrap().push((job_id.to_string(), key_doc.clone()));
+        self.run_in_process_calls
+            .lock()
+            .unwrap()
+            .push((job_id.to_string(), key_doc.clone()));
         Ok(())
     }
 }
@@ -250,7 +293,10 @@ fn base_job(id: &str) -> JobDef {
         resources: BTreeMap::new(),
         store_target: None,
         retain: Retain::Default,
-        exec_template: ExecTemplate::Argv { argv: vec!["mock".to_string(), id.to_string()], allow_network: false },
+        exec_template: ExecTemplate::Argv {
+            argv: vec!["mock".to_string(), id.to_string()],
+            allow_network: false,
+        },
         view: BTreeMap::new(),
         fixed_output: None,
         graph_job: false,
@@ -261,7 +307,12 @@ fn base_job(id: &str) -> JobDef {
 fn dep_job(id: &str, deps: &[(&str, &str)]) -> JobDef {
     let mut j = base_job(id);
     for (name, parent) in deps {
-        j.inputs.insert(name.to_string(), InputRef::Job { id: parent.to_string() });
+        j.inputs.insert(
+            name.to_string(),
+            InputRef::Job {
+                id: parent.to_string(),
+            },
+        );
     }
     j
 }
@@ -314,14 +365,33 @@ fn diamond_all_miss() {
     let callbacks = TestCallbacks::new();
     let abort = AtomicBool::new(false);
 
-    let report =
-        scheduler::run(&storeset, &exec, diamond_jobs(), &callbacks, &parallelism(4, &[]), &abort).unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        diamond_jobs(),
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+    )
+    .unwrap();
 
     let mut built = report.built.clone();
     built.sort();
-    assert_eq!(built, vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]);
+    assert_eq!(
+        built,
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string()
+        ]
+    );
     assert!(report.hits.is_empty());
-    assert!(report.failed.is_empty(), "unexpected failures: {:?}", report.failed);
+    assert!(
+        report.failed.is_empty(),
+        "unexpected failures: {:?}",
+        report.failed
+    );
     assert_eq!(report.job_entries.len(), 4);
 
     for id in ["a", "b", "c", "d"] {
@@ -347,19 +417,45 @@ fn second_run_all_hits() {
     let callbacks = TestCallbacks::new();
     let abort = AtomicBool::new(false);
 
-    let report1 =
-        scheduler::run(&storeset, &exec1, diamond_jobs(), &callbacks, &parallelism(4, &[]), &abort).unwrap();
+    let report1 = scheduler::run(
+        &storeset,
+        &exec1,
+        diamond_jobs(),
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+    )
+    .unwrap();
     assert_eq!(report1.built.len(), 4);
 
     // Deliberately unconfigured: any invocation at all is a bug.
     let exec2 = MockExecutor::new();
-    let report2 =
-        scheduler::run(&storeset, &exec2, diamond_jobs(), &callbacks, &parallelism(4, &[]), &abort).unwrap();
+    let report2 = scheduler::run(
+        &storeset,
+        &exec2,
+        diamond_jobs(),
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+    )
+    .unwrap();
 
-    assert_eq!(exec2.total_invocations(), 0, "second run must not execute anything");
+    assert_eq!(
+        exec2.total_invocations(),
+        0,
+        "second run must not execute anything"
+    );
     let mut hits = report2.hits.clone();
     hits.sort();
-    assert_eq!(hits, vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]);
+    assert_eq!(
+        hits,
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string()
+        ]
+    );
     assert!(report2.built.is_empty());
     assert!(report2.failed.is_empty());
     assert_eq!(report2.job_entries, report1.job_entries);
@@ -377,8 +473,15 @@ fn early_cutoff() {
     let callbacks = TestCallbacks::new();
     let abort = AtomicBool::new(false);
 
-    let report1 =
-        scheduler::run(&storeset, &exec1, diamond_jobs(), &callbacks, &parallelism(4, &[]), &abort).unwrap();
+    let report1 = scheduler::run(
+        &storeset,
+        &exec1,
+        diamond_jobs(),
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+    )
+    .unwrap();
 
     let mut jobs2 = diamond_jobs();
     for j in jobs2.iter_mut() {
@@ -390,13 +493,23 @@ fn early_cutoff() {
     // Same content as run 1's "b" -> same oh despite the new ik.
     exec2.set_output("b", &[("b.txt", b"B")]);
 
-    let report2 =
-        scheduler::run(&storeset, &exec2, jobs2, &callbacks, &parallelism(4, &[]), &abort).unwrap();
+    let report2 = scheduler::run(
+        &storeset,
+        &exec2,
+        jobs2,
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+    )
+    .unwrap();
 
     assert_eq!(report2.built, vec!["b".to_string()]);
     let mut hits = report2.hits.clone();
     hits.sort();
-    assert_eq!(hits, vec!["a".to_string(), "c".to_string(), "d".to_string()]);
+    assert_eq!(
+        hits,
+        vec!["a".to_string(), "c".to_string(), "d".to_string()]
+    );
 
     assert_eq!(exec2.count("b"), 1);
     assert_eq!(exec2.count("a"), 0);
@@ -406,7 +519,10 @@ fn early_cutoff() {
     let (ik_b1, oh_b1) = report1.job_entries.get("b").unwrap();
     let (ik_b2, oh_b2) = report2.job_entries.get("b").unwrap();
     assert_ne!(ik_b1, ik_b2, "b's recipe changed, its ik must change");
-    assert_eq!(oh_b1, oh_b2, "b's content did not change, its oh must be stable");
+    assert_eq!(
+        oh_b1, oh_b2,
+        "b's content did not change, its oh must be stable"
+    );
 
     // D never even re-derives a different key: identical (ik, oh).
     assert_eq!(report1.job_entries.get("d"), report2.job_entries.get("d"));
@@ -424,7 +540,12 @@ fn parameter_flip_k_minus_2() {
     let make = |leaf_hash: &str| {
         let mut j = base_job("a");
         j.outputs_declared = vec!["out.txt".to_string()];
-        j.inputs.insert("param".to_string(), InputRef::Leaf { hash: leaf_hash.to_string() });
+        j.inputs.insert(
+            "param".to_string(),
+            InputRef::Leaf {
+                hash: leaf_hash.to_string(),
+            },
+        );
         vec![j]
     };
 
@@ -433,15 +554,29 @@ fn parameter_flip_k_minus_2() {
 
     let exec1 = MockExecutor::new();
     exec1.set_output("a", &[("out.txt", b"content")]);
-    let report1 =
-        scheduler::run(&storeset, &exec1, make(&p1), &callbacks, &parallelism(2, &[]), &abort).unwrap();
+    let report1 = scheduler::run(
+        &storeset,
+        &exec1,
+        make(&p1),
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
     assert_eq!(report1.built, vec!["a".to_string()]);
     let entry1 = report1.job_entries.get("a").unwrap().clone();
 
     let exec2 = MockExecutor::new();
     exec2.set_output("a", &[("out.txt", b"content")]);
-    let report2 =
-        scheduler::run(&storeset, &exec2, make(&p2), &callbacks, &parallelism(2, &[]), &abort).unwrap();
+    let report2 = scheduler::run(
+        &storeset,
+        &exec2,
+        make(&p2),
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
     assert_eq!(report2.built, vec!["a".to_string()]);
     let entry2 = report2.job_entries.get("a").unwrap().clone();
     assert_ne!(entry1.0, entry2.0, "different param -> different ik");
@@ -449,8 +584,15 @@ fn parameter_flip_k_minus_2() {
 
     // Deliberately unconfigured: p1 again must be a pure hit.
     let exec3 = MockExecutor::new();
-    let report3 =
-        scheduler::run(&storeset, &exec3, make(&p1), &callbacks, &parallelism(2, &[]), &abort).unwrap();
+    let report3 = scheduler::run(
+        &storeset,
+        &exec3,
+        make(&p1),
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
     assert_eq!(exec3.total_invocations(), 0);
     assert_eq!(report3.hits, vec!["a".to_string()]);
     assert!(report3.built.is_empty());
@@ -477,12 +619,20 @@ fn subset_early_cutoff() {
         child1.outputs_declared = vec!["out.txt".to_string()];
         child1.inputs.insert(
             "sub".to_string(),
-            InputRef::JobSubset { id: "p".to_string(), names: vec!["a.txt".to_string()] },
+            InputRef::JobSubset {
+                id: "p".to_string(),
+                names: vec!["a.txt".to_string()],
+            },
         );
 
         let mut child2 = base_job("child2");
         child2.outputs_declared = vec!["out.txt".to_string()];
-        child2.inputs.insert("whole".to_string(), InputRef::Job { id: "p".to_string() });
+        child2.inputs.insert(
+            "whole".to_string(),
+            InputRef::Job {
+                id: "p".to_string(),
+            },
+        );
 
         vec![p, child1, child2]
     };
@@ -491,16 +641,30 @@ fn subset_early_cutoff() {
     exec1.set_output("p", &[("a.txt", b"A1"), ("b.txt", b"B1")]);
     exec1.set_output("child1", &[("out.txt", b"child1-out")]);
     exec1.set_output("child2", &[("out.txt", b"child2-out")]);
-    let report1 = scheduler::run(&storeset, &exec1, make_jobs("recipe-p-v1"), &callbacks, &parallelism(4, &[]), &abort)
-        .unwrap();
+    let report1 = scheduler::run(
+        &storeset,
+        &exec1,
+        make_jobs("recipe-p-v1"),
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+    )
+    .unwrap();
     assert_eq!(report1.built.len(), 3);
 
     // p rebuilds (new recipe); a.txt unchanged, b.txt changed.
     let exec2 = MockExecutor::new();
     exec2.set_output("p", &[("a.txt", b"A1"), ("b.txt", b"B2")]);
     exec2.set_output("child2", &[("out.txt", b"child2-out")]);
-    let report2 = scheduler::run(&storeset, &exec2, make_jobs("recipe-p-v2"), &callbacks, &parallelism(4, &[]), &abort)
-        .unwrap();
+    let report2 = scheduler::run(
+        &storeset,
+        &exec2,
+        make_jobs("recipe-p-v2"),
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+    )
+    .unwrap();
 
     let mut built = report2.built.clone();
     built.sort();
@@ -509,9 +673,16 @@ fn subset_early_cutoff() {
 
     assert_eq!(exec2.count("p"), 1);
     assert_eq!(exec2.count("child2"), 1);
-    assert_eq!(exec2.count("child1"), 0, "child1 must stay a hit (its subset input is unchanged)");
+    assert_eq!(
+        exec2.count("child1"),
+        0,
+        "child1 must stay a hit (its subset input is unchanged)"
+    );
 
-    assert_eq!(report1.job_entries.get("child1"), report2.job_entries.get("child1"));
+    assert_eq!(
+        report1.job_entries.get("child1"),
+        report2.job_entries.get("child1")
+    );
     assert_ne!(
         report1.job_entries.get("child2"),
         report2.job_entries.get("child2"),
@@ -537,8 +708,15 @@ fn failure_propagation() {
 
     let callbacks = TestCallbacks::new();
     let abort = AtomicBool::new(false);
-    let report =
-        scheduler::run(&storeset, &exec, vec![a, b, c, d], &callbacks, &parallelism(4, &[]), &abort).unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        vec![a, b, c, d],
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+    )
+    .unwrap();
 
     let mut built = report.built.clone();
     built.sort();
@@ -558,7 +736,11 @@ fn failure_propagation() {
         report.failed["c"]
     );
 
-    assert_eq!(exec.count("c"), 0, "c must never dispatch once its only parent failed");
+    assert_eq!(
+        exec.count("c"),
+        0,
+        "c must never dispatch once its only parent failed"
+    );
     assert_eq!(exec.count("b"), 1);
 }
 
@@ -573,16 +755,31 @@ fn failure_log_written_on_nonzero_exit() {
 
     let callbacks = TestCallbacks::new();
     let abort = AtomicBool::new(false);
-    let report =
-        scheduler::run(&storeset, &exec, vec![base_job("b")], &callbacks, &parallelism(2, &[]), &abort)
-            .unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        vec![base_job("b")],
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
 
-    let detail = report.failed_details.get("b").expect("structured detail for b");
+    let detail = report
+        .failed_details
+        .get("b")
+        .expect("structured detail for b");
     assert_eq!(detail.exit_code, Some(7));
-    let log_path = detail.failure_log.as_deref().expect("failure_log path present");
+    let log_path = detail
+        .failure_log
+        .as_deref()
+        .expect("failure_log path present");
     let text = std::fs::read_to_string(log_path).expect("failure.log must exist on disk");
     assert!(text.contains("exit code: 7"), "log:\n{text}");
-    assert!(text.contains("configured to exit 7"), "captured stderr missing:\n{text}");
+    assert!(
+        text.contains("configured to exit 7"),
+        "captured stderr missing:\n{text}"
+    );
 }
 
 /// A job the *executor fails to run at all* (spawn/staging/template-startup)
@@ -597,15 +794,30 @@ fn failure_log_written_on_executor_error() {
 
     let callbacks = TestCallbacks::new();
     let abort = AtomicBool::new(false);
-    let report =
-        scheduler::run(&storeset, &exec, vec![base_job("b")], &callbacks, &parallelism(2, &[]), &abort)
-            .unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        vec![base_job("b")],
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
 
-    let detail = report.failed_details.get("b").expect("structured detail for b");
+    let detail = report
+        .failed_details
+        .get("b")
+        .expect("structured detail for b");
     assert_eq!(detail.exit_code, None, "no process ran, so no exit code");
-    let log_path = detail.failure_log.as_deref().expect("failure_log path present");
+    let log_path = detail
+        .failure_log
+        .as_deref()
+        .expect("failure_log path present");
     let text = std::fs::read_to_string(log_path).expect("failure.log must exist on disk");
-    assert!(text.contains("rust error"), "rust-error section missing:\n{text}");
+    assert!(
+        text.contains("rust error"),
+        "rust-error section missing:\n{text}"
+    );
     assert!(
         text.contains("simulated staging failure (ENOENT)"),
         "rendered rust error missing:\n{text}"
@@ -627,9 +839,19 @@ fn graph_error_before_dispatch() {
         let exec = MockExecutor::new();
         let a = dep_job("a", &[("x", "b")]);
         let b = dep_job("b", &[("x", "a")]);
-        let err =
-            scheduler::run(&storeset, &exec, vec![a, b], &callbacks, &parallelism(2, &[]), &abort).unwrap_err();
-        assert!(matches!(err.current_context(), Error::Graph(_)), "cycle must be Error::Graph, got {err:?}");
+        let err = scheduler::run(
+            &storeset,
+            &exec,
+            vec![a, b],
+            &callbacks,
+            &parallelism(2, &[]),
+            &abort,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.current_context(), Error::Graph(_)),
+            "cycle must be Error::Graph, got {err:?}"
+        );
         assert_eq!(exec.total_invocations(), 0);
     }
 
@@ -637,8 +859,19 @@ fn graph_error_before_dispatch() {
         let (_dir, storeset) = fresh_storeset();
         let exec = MockExecutor::new();
         let a = dep_job("a", &[("x", "missing")]);
-        let err = scheduler::run(&storeset, &exec, vec![a], &callbacks, &parallelism(2, &[]), &abort).unwrap_err();
-        assert!(matches!(err.current_context(), Error::Graph(_)), "unknown dep must be Error::Graph, got {err:?}");
+        let err = scheduler::run(
+            &storeset,
+            &exec,
+            vec![a],
+            &callbacks,
+            &parallelism(2, &[]),
+            &abort,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.current_context(), Error::Graph(_)),
+            "unknown dep must be Error::Graph, got {err:?}"
+        );
         assert_eq!(exec.total_invocations(), 0);
     }
 
@@ -647,9 +880,19 @@ fn graph_error_before_dispatch() {
         let exec = MockExecutor::new();
         let a1 = base_job("a");
         let a2 = base_job("a");
-        let err =
-            scheduler::run(&storeset, &exec, vec![a1, a2], &callbacks, &parallelism(2, &[]), &abort).unwrap_err();
-        assert!(matches!(err.current_context(), Error::Graph(_)), "duplicate id must be Error::Graph, got {err:?}");
+        let err = scheduler::run(
+            &storeset,
+            &exec,
+            vec![a1, a2],
+            &callbacks,
+            &parallelism(2, &[]),
+            &abort,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.current_context(), Error::Graph(_)),
+            "duplicate id must be Error::Graph, got {err:?}"
+        );
         assert_eq!(exec.total_invocations(), 0);
     }
 
@@ -658,9 +901,19 @@ fn graph_error_before_dispatch() {
         let exec = MockExecutor::new();
         let mut a = base_job("a");
         a.resources.insert("slots".to_string(), 10);
-        let err = scheduler::run(&storeset, &exec, vec![a], &callbacks, &parallelism(2, &[("slots", 1)]), &abort)
-            .unwrap_err();
-        assert!(matches!(err.current_context(), Error::Graph(_)), "over-capacity request must be Error::Graph, got {err:?}");
+        let err = scheduler::run(
+            &storeset,
+            &exec,
+            vec![a],
+            &callbacks,
+            &parallelism(2, &[("slots", 1)]),
+            &abort,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.current_context(), Error::Graph(_)),
+            "over-capacity request must be Error::Graph, got {err:?}"
+        );
         assert_eq!(exec.total_invocations(), 0);
     }
 }
@@ -683,12 +936,23 @@ fn abort_stops_dispatch() {
     let c = dep_job("c", &[("b", "b")]);
 
     let callbacks = TestCallbacks::new();
-    let report =
-        scheduler::run(&storeset, &exec, vec![a, b, c], &callbacks, &parallelism(4, &[]), abort.as_ref()).unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        vec![a, b, c],
+        &callbacks,
+        &parallelism(4, &[]),
+        abort.as_ref(),
+    )
+    .unwrap();
 
     assert_eq!(report.built, vec!["a".to_string()]);
     assert!(report.hits.is_empty());
-    assert!(report.failed.is_empty(), "b/c must not be reported as failed either: {:?}", report.failed);
+    assert!(
+        report.failed.is_empty(),
+        "b/c must not be reported as failed either: {:?}",
+        report.failed
+    );
     assert_eq!(exec.count("a"), 1);
     assert_eq!(exec.count("b"), 0, "b must never dispatch after abort");
     assert_eq!(exec.count("c"), 0, "c must never dispatch after abort");
@@ -729,25 +993,50 @@ fn graph_job_expansion() {
     let cb1 = TestCallbacks::new();
     cb1.set_expansion("g", expansion1);
 
-    let report1 = scheduler::run(&storeset, &exec1, jobs1, &cb1, &parallelism(4, &[]), &abort).unwrap();
+    let report1 =
+        scheduler::run(&storeset, &exec1, jobs1, &cb1, &parallelism(4, &[]), &abort).unwrap();
 
     let mut built1 = report1.built.clone();
     built1.sort();
-    assert_eq!(built1, vec!["base".to_string(), "g".to_string(), "x".to_string(), "y".to_string()]);
-    assert_eq!(report1.job_entries.len(), 3, "g itself produces no store entry");
+    assert_eq!(
+        built1,
+        vec![
+            "base".to_string(),
+            "g".to_string(),
+            "x".to_string(),
+            "y".to_string()
+        ]
+    );
+    assert_eq!(
+        report1.job_entries.len(),
+        3,
+        "g itself produces no store entry"
+    );
     assert!(!report1.job_entries.contains_key("g"));
 
     let (jobs2, expansion2) = make();
     let exec2 = MockExecutor::new(); // deliberately unconfigured
     let cb2 = TestCallbacks::new();
     cb2.set_expansion("g", expansion2);
-    let report2 = scheduler::run(&storeset, &exec2, jobs2, &cb2, &parallelism(4, &[]), &abort).unwrap();
+    let report2 =
+        scheduler::run(&storeset, &exec2, jobs2, &cb2, &parallelism(4, &[]), &abort).unwrap();
 
-    assert_eq!(exec2.total_invocations(), 0, "expanded jobs must be pure hits on rerun");
+    assert_eq!(
+        exec2.total_invocations(),
+        0,
+        "expanded jobs must be pure hits on rerun"
+    );
     let mut hits2 = report2.hits.clone();
     hits2.sort();
-    assert_eq!(hits2, vec!["base".to_string(), "x".to_string(), "y".to_string()]);
-    assert_eq!(report2.built, vec!["g".to_string()], "g always re-expands (it has no store entry to cache)");
+    assert_eq!(
+        hits2,
+        vec!["base".to_string(), "x".to_string(), "y".to_string()]
+    );
+    assert_eq!(
+        report2.built,
+        vec!["g".to_string()],
+        "g always re-expands (it has no store entry to cache)"
+    );
 }
 
 /// Determinism enforcement (§9): "publish-time (always on): inputs/<ik>
@@ -782,14 +1071,29 @@ fn determinism_violation_surfaces() {
     let abort = AtomicBool::new(false);
     // At least 2 real worker threads are required for the two independent,
     // barrier-synchronized jobs to race genuinely.
-    let report =
-        scheduler::run(&storeset, &exec, vec![a, b], &callbacks, &parallelism(2, &[]), &abort).unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        vec![a, b],
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
 
     assert_eq!(exec.count("detA"), 1);
     assert_eq!(exec.count("detB"), 1);
 
-    assert_eq!(report.built.len(), 1, "exactly one of detA/detB should publish: {report:?}");
-    assert_eq!(report.failed.len(), 1, "exactly one of detA/detB should fail with a determinism violation: {report:?}");
+    assert_eq!(
+        report.built.len(),
+        1,
+        "exactly one of detA/detB should publish: {report:?}"
+    );
+    assert_eq!(
+        report.failed.len(),
+        1,
+        "exactly one of detA/detB should fail with a determinism violation: {report:?}"
+    );
     let loser = report.failed.keys().next().unwrap();
     assert!(["detA", "detB"].contains(&loser.as_str()));
     let msg = &report.failed[loser];
@@ -820,7 +1124,10 @@ fn fixed_output_verified() {
     let file_blake3 = content.values().next().unwrap().blake3.clone();
     let oh = ppg3_core::manifest::output_hash(&content).unwrap();
     // The two are categorically different hashes — this is the whole point.
-    assert_ne!(file_blake3, oh, "file content hash must differ from the output hash");
+    assert_ne!(
+        file_blake3, oh,
+        "file content hash must differ from the output hash"
+    );
 
     let exec = MockExecutor::new();
     exec.set_output("f_ok", &[("out.txt", b"fixed-content")]);
@@ -860,8 +1167,14 @@ fn fixed_output_verified() {
     );
     assert!(report.failed.contains_key("f_bad_wrong"));
     let msg = &report.failed["f_bad_wrong"];
-    assert!(msg.contains(&wrong), "expected declared blake3 in message: {msg}");
-    assert!(msg.contains(&file_blake3), "expected actual file blake3 in message: {msg}");
+    assert!(
+        msg.contains(&wrong),
+        "expected declared blake3 in message: {msg}"
+    );
+    assert!(
+        msg.contains(&file_blake3),
+        "expected actual file blake3 in message: {msg}"
+    );
     // The successful job's store entry is still keyed by its oh.
     assert_eq!(report.job_entries.get("f_ok").unwrap().1, oh);
 }
@@ -884,16 +1197,34 @@ fn inprocess_loader() {
 
     let cb = TestCallbacks::new();
     let exec = MockExecutor::new();
-    let report =
-        scheduler::run(&storeset, &exec, vec![loader.clone()], &cb, &parallelism(2, &[]), &abort).unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        vec![loader.clone()],
+        &cb,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
 
     assert_eq!(report.built, vec!["loader".to_string()]);
-    assert!(!report.job_entries.contains_key("loader"), "InProcess jobs produce no store entry");
+    assert!(
+        !report.job_entries.contains_key("loader"),
+        "InProcess jobs produce no store entry"
+    );
     assert_eq!(cb.run_in_process_call_count(), 1);
     let calls = cb.run_in_process_calls.lock().unwrap();
     assert_eq!(calls[0].0, "loader");
     let doc = &calls[0].1;
-    for key in ["ppg3_key_version", "job_recipe", "inputs", "tools", "runtime", "env", "outputs_declared"] {
+    for key in [
+        "ppg3_key_version",
+        "job_recipe",
+        "inputs",
+        "tools",
+        "runtime",
+        "env",
+        "outputs_declared",
+    ] {
         assert!(doc.get(key).is_some(), "key doc missing {key:?}: {doc}");
     }
     assert_eq!(doc["ppg3_key_version"], serde_json::json!(1));
@@ -905,10 +1236,24 @@ fn inprocess_loader() {
     consumer.outputs_declared = vec!["out.txt".to_string()];
     let cb2 = TestCallbacks::new();
     let exec2 = MockExecutor::new();
-    let err = scheduler::run(&storeset2, &exec2, vec![loader, consumer], &cb2, &parallelism(2, &[]), &abort)
-        .unwrap_err();
-    assert!(matches!(err.current_context(), Error::Graph(_)), "InProcess job as a store input must be Error::Graph, got {err:?}");
-    assert_eq!(cb2.run_in_process_call_count(), 0, "validation must fail before any dispatch");
+    let err = scheduler::run(
+        &storeset2,
+        &exec2,
+        vec![loader, consumer],
+        &cb2,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err.current_context(), Error::Graph(_)),
+        "InProcess job as a store input must be Error::Graph, got {err:?}"
+    );
+    assert_eq!(
+        cb2.run_in_process_call_count(),
+        0,
+        "validation must fail before any dispatch"
+    );
     assert_eq!(exec2.total_invocations(), 0);
 }
 
@@ -933,13 +1278,27 @@ fn resource_serialization_pool_of_one_serializes() {
 
     let callbacks = TestCallbacks::new();
     let abort = AtomicBool::new(false);
-    let report =
-        scheduler::run(&storeset, &exec, jobs, &callbacks, &parallelism(3, &[("slots", 1)]), &abort).unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        jobs,
+        &callbacks,
+        &parallelism(3, &[("slots", 1)]),
+        &abort,
+    )
+    .unwrap();
 
     let mut built = report.built.clone();
     built.sort();
-    assert_eq!(built, vec!["j1".to_string(), "j2".to_string(), "j3".to_string()]);
-    assert_eq!(exec.max_concurrency(), 1, "a pool of 1 slot must fully serialize execution");
+    assert_eq!(
+        built,
+        vec!["j1".to_string(), "j2".to_string(), "j3".to_string()]
+    );
+    assert_eq!(
+        exec.max_concurrency(),
+        1,
+        "a pool of 1 slot must fully serialize execution"
+    );
 }
 
 /// Same 3 jobs, but the pool has enough capacity that they need not
@@ -964,11 +1323,21 @@ fn resource_serialization_pool_of_three_allows_all_to_run() {
 
     let callbacks = TestCallbacks::new();
     let abort = AtomicBool::new(false);
-    let report =
-        scheduler::run(&storeset, &exec, jobs, &callbacks, &parallelism(3, &[("slots", 3)]), &abort).unwrap();
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        jobs,
+        &callbacks,
+        &parallelism(3, &[("slots", 3)]),
+        &abort,
+    )
+    .unwrap();
 
     let mut built = report.built.clone();
     built.sort();
-    assert_eq!(built, vec!["k1".to_string(), "k2".to_string(), "k3".to_string()]);
+    assert_eq!(
+        built,
+        vec!["k1".to_string(), "k2".to_string(), "k3".to_string()]
+    );
     assert_eq!(exec.total_invocations(), 3);
 }

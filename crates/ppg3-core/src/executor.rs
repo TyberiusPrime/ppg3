@@ -106,7 +106,11 @@ fn ppg_name(virtual_path: &str) -> Result<&str> {
     Path::new(virtual_path)
         .file_name()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| Report::new(Error::Other(format!("malformed virtual mount path: {virtual_path:?}"))))
+        .ok_or_else(|| {
+            Report::new(Error::Other(format!(
+                "malformed virtual mount path: {virtual_path:?}"
+            )))
+        })
 }
 
 // Trait objects are executors too — lets a caller pick the fallback
@@ -217,8 +221,7 @@ pub(crate) fn stage(job: &PreparedJob, work_parent: &Path) -> Result<StagedJob> 
     // `argv[0]` is then resolved against the *new* cwd — doubling the prefix
     // and failing with ENOENT (a real binary "not found"). Absolutize once,
     // here, so every downstream path (argv, cwd, symlink names) is anchored.
-    let work_parent = std::path::absolute(work_parent)
-        .map_err(|e| Error::io(work_parent, e))?;
+    let work_parent = std::path::absolute(work_parent).map_err(|e| Error::io(work_parent, e))?;
     let work = work_parent.join(unique_name(&job.ik));
     build_layout(job, &work)?;
 
@@ -314,7 +317,9 @@ impl Executor for NoneExecutor {
             .attach_with(|| format!("NoneExecutor: staging job {:?}", job.ik))?;
 
         if staged.argv.is_empty() {
-            return Err(Report::new(Error::Other("PreparedJob.argv is empty".to_string())));
+            return Err(Report::new(Error::Other(
+                "PreparedJob.argv is empty".to_string(),
+            )));
         }
 
         // Weakly-hermetic bootstrap pass-through (shared with the forkserver
@@ -1070,10 +1075,15 @@ mod tests {
             vec!["/nonexistent/definitely-not-a-binary".to_string()],
             &[],
         );
-        let report = exec.run(&job).expect_err("missing argv[0] must be an executor error");
+        let report = exec
+            .run(&job)
+            .expect_err("missing argv[0] must be an executor error");
         assert!(matches!(report.current_context(), Error::Other(_)));
         let rendered = format!("{report:?}");
-        assert!(rendered.contains("spawning"), "message missing:\n{rendered}");
+        assert!(
+            rendered.contains("spawning"),
+            "message missing:\n{rendered}"
+        );
         assert!(
             rendered.contains("executor.rs:"),
             "no file:line origin in report:\n{rendered}"
@@ -1095,7 +1105,9 @@ mod tests {
             &[],
         );
         let exec = BwrapExecutor::new("/nonexistent/bwrap");
-        let report = exec.run(&job).expect_err("missing bwrap must be an executor error");
+        let report = exec
+            .run(&job)
+            .expect_err("missing bwrap must be an executor error");
         let rendered = format!("{report:?}");
         assert!(rendered.contains("bwrap"), "message missing:\n{rendered}");
         assert!(

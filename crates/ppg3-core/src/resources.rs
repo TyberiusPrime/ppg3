@@ -264,6 +264,10 @@ mod tests {
             "pool of capacity {CAPACITY} was over-subscribed: observed {}",
             max_observed.load(Ordering::SeqCst)
         );
-        assert_eq!(in_use.load(Ordering::SeqCst), 0, "all acquisitions must have released");
+        assert_eq!(
+            in_use.load(Ordering::SeqCst),
+            0,
+            "all acquisitions must have released"
+        );
     }
 }

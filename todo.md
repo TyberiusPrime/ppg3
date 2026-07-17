@@ -164,6 +164,10 @@ It needs to be able to produce the link tree in a different folder.
 -- 
 where is the 'materialize' command that turns an output folder into 
 a non-symlinked copy?
+  [RESOLVED — `ppg3 materialize <dest> [--generation N]` copies a
+   generation's view tree into a fresh directory of real, writable files
+   (0644), dereferencing the store symlinks; refuses to clobber an existing
+   dest. Core: `views::materialize`.]
 
 -- 
 ux generations:

@@ -39,9 +39,9 @@ use std::path::PathBuf;
 #[cfg(not(all(target_os = "linux", feature = "linux-sandbox")))]
 use crate::error::Error;
 #[cfg(not(all(target_os = "linux", feature = "linux-sandbox")))]
-use error_stack::Report;
-#[cfg(not(all(target_os = "linux", feature = "linux-sandbox")))]
 use crate::Result;
+#[cfg(not(all(target_os = "linux", feature = "linux-sandbox")))]
+use error_stack::Report;
 
 /// One bind mount to set up under the new root, relative to it (e.g.
 /// `in/data`, `tools/py`, `out`, `log`, mirroring `/ppg/...` §6.1).

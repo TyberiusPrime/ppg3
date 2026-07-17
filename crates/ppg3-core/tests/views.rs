@@ -128,6 +128,69 @@ fn view_symlinks_resolve_to_real_content() {
 }
 
 #[test]
+fn materialize_writes_real_writable_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Store::open("s", store_dir.path(), false).unwrap();
+    let oh_a = publish_one(&store, "mat-a", "a.txt", b"alpha\n");
+    let oh_b = publish_one(&store, "mat-b", "b.txt", b"beta\n");
+
+    let stores = StoreSet::new(vec![store]);
+    let project = tempfile::tempdir().unwrap();
+    let project_dir = project.path().join(".ppg3");
+
+    let spec = ViewSpec {
+        entries: vec![
+            ViewEntry {
+                view_rel_path: "top.txt".to_string(),
+                oh: oh_a,
+                path_within_entry: "a.txt".to_string(),
+                store_index: 0,
+            },
+            ViewEntry {
+                view_rel_path: "nested/deep.txt".to_string(),
+                oh: oh_b,
+                path_within_entry: "b.txt".to_string(),
+                store_index: 0,
+            },
+        ],
+    };
+    views::write_generation(&project_dir, "proj", &stores, &spec, false).unwrap();
+
+    let dest = project.path().join("exported");
+    let report = views::materialize(&project_dir, None, &dest).unwrap();
+    assert_eq!(report.generation, 1);
+    assert_eq!(report.files, 2);
+
+    // Content is copied, nested layout preserved.
+    assert_eq!(
+        std::fs::read_to_string(dest.join("top.txt")).unwrap(),
+        "alpha\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("nested/deep.txt")).unwrap(),
+        "beta\n"
+    );
+
+    // Copies are real files (not symlinks) and writable, unlike the 0444
+    // store entries they came from.
+    let meta = std::fs::symlink_metadata(dest.join("top.txt")).unwrap();
+    assert!(
+        !meta.file_type().is_symlink(),
+        "materialized file is a symlink"
+    );
+    assert_eq!(
+        meta.permissions().mode() & 0o200,
+        0o200,
+        "copy must be writable"
+    );
+
+    // Refuses to clobber an existing destination.
+    assert!(views::materialize(&project_dir, None, &dest).is_err());
+}
+
+#[test]
 fn atomic_current_swap_leaves_old_generation_links_intact() {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Store::open("s", store_dir.path(), false).unwrap();
@@ -700,11 +763,19 @@ fn project_reset_leaves_only_the_current_generations_entry() {
     let project_dir = project.path().join(".ppg3");
 
     write_gen(&project_dir, &stores, "old1", false, Some(sample_vcs(true)));
-    write_gen(&project_dir, &stores, "old2", false, Some(sample_vcs(false)));
+    write_gen(
+        &project_dir,
+        &stores,
+        "old2",
+        false,
+        Some(sample_vcs(false)),
+    );
     let cur = write_gen(&project_dir, &stores, "cur", false, Some(sample_vcs(true)));
 
     // The current generation's single entry — the one thing that must survive.
-    let cur_oh = views::read_generation_meta(&project_dir, cur).unwrap().entries[0]
+    let cur_oh = views::read_generation_meta(&project_dir, cur)
+        .unwrap()
+        .entries[0]
         .oh
         .clone();
 

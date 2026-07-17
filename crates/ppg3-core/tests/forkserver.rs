@@ -250,7 +250,10 @@ fn command_job(out_dir: &Path, log_dir: &Path) -> PreparedJob {
 fn make_manager(work_parent: &Path, template_script: &Path) -> Arc<TemplateManager> {
     Arc::new(TemplateManager::new(
         work_parent.to_path_buf(),
-        vec!["python3".to_string(), template_script.to_string_lossy().into_owned()],
+        vec![
+            "python3".to_string(),
+            template_script.to_string_lossy().into_owned(),
+        ],
     ))
 }
 
@@ -293,8 +296,18 @@ fn two_jobs_dispatch_concurrently_through_one_template() {
 
     let ra = result.0.expect("job a dispatch");
     let rb = result.1.expect("job b dispatch");
-    assert_eq!(ra.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&ra.stderr));
-    assert_eq!(rb.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&rb.stderr));
+    assert_eq!(
+        ra.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&ra.stderr)
+    );
+    assert_eq!(
+        rb.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&rb.stderr)
+    );
 
     let stdout_a = std::fs::read_to_string(root.path().join("log-a").join("stdout.txt")).unwrap();
     let stdout_b = std::fs::read_to_string(root.path().join("log-b").join("stdout.txt")).unwrap();
@@ -317,7 +330,11 @@ fn two_jobs_dispatch_concurrently_through_one_template() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("template-"))
         .collect();
-    assert_eq!(template_logs.len(), 1, "expected exactly one template spawned: {template_logs:?}");
+    assert_eq!(
+        template_logs.len(),
+        1,
+        "expected exactly one template spawned: {template_logs:?}"
+    );
 }
 
 #[test]
@@ -343,9 +360,14 @@ fn template_death_mid_job_errors_then_respawn_serves_next_job() {
         &root.path().join("log-d"),
         &[("TEST_SELFDESTRUCT", "1")],
     );
-    let err = exec.run(&dying_job).expect_err("dying job must surface an error");
+    let err = exec
+        .run(&dying_job)
+        .expect_err("dying job must surface an error");
     let msg = err.to_string();
-    assert!(msg.contains("died twice"), "unexpected error message: {msg}");
+    assert!(
+        msg.contains("died twice"),
+        "unexpected error message: {msg}"
+    );
 
     // A normal job with the *same* (interpreter, preload) template key
     // dispatched afterwards must still work — proves get_or_spawn respawns
@@ -357,7 +379,12 @@ fn template_death_mid_job_errors_then_respawn_serves_next_job() {
         &[("TEST_STDOUT", "alive-again"), ("TEST_EXIT_CODE", "0")],
     );
     let result = exec.run(&ok_job).expect("job after respawn must succeed");
-    assert_eq!(result.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(
+        result.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let stdout = std::fs::read_to_string(root.path().join("log-e").join("stdout.txt")).unwrap();
     assert_eq!(stdout, "alive-again");
 }
@@ -383,8 +410,15 @@ fn nonshim_argv_falls_back_to_none_executor() {
     let exec = ForkserverExecutor::new(manager, fallback);
 
     let job = command_job(&root.path().join("out-c"), &root.path().join("log-c"));
-    let result = exec.run(&job).expect("plain CommandJob argv must fall back to NoneExecutor");
-    assert_eq!(result.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    let result = exec
+        .run(&job)
+        .expect("plain CommandJob argv must fall back to NoneExecutor");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let content = std::fs::read_to_string(root.path().join("out-c").join("marker.txt")).unwrap();
     assert_eq!(content, "fallback-ran\n");
 }
@@ -415,9 +449,13 @@ fn manager_outlives_executors_same_template_reused_then_shutdown_respawns() {
         &[("TEST_WRITE_PPID", "1")],
     );
     let r1 = exec_a.run(&job1).expect("job1 dispatch");
-    assert_eq!(r1.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&r1.stderr));
-    let ppid1 =
-        std::fs::read_to_string(root.path().join("log-1").join("stdout.txt")).unwrap();
+    assert_eq!(
+        r1.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+    let ppid1 = std::fs::read_to_string(root.path().join("log-1").join("stdout.txt")).unwrap();
     // Dropping executor A (as `ppg3.run()` would at the end of a run) must
     // NOT kill the manager's template — that is the entire point of the
     // ownership split (§6.7).
@@ -433,9 +471,13 @@ fn manager_outlives_executors_same_template_reused_then_shutdown_respawns() {
         &[("TEST_WRITE_PPID", "1")],
     );
     let r2 = exec_b.run(&job2).expect("job2 dispatch");
-    assert_eq!(r2.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&r2.stderr));
-    let ppid2 =
-        std::fs::read_to_string(root.path().join("log-2").join("stdout.txt")).unwrap();
+    assert_eq!(
+        r2.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+    let ppid2 = std::fs::read_to_string(root.path().join("log-2").join("stdout.txt")).unwrap();
     assert_eq!(
         ppid1, ppid2,
         "executor B must reuse the same warm template executor A used (same template pid)"
@@ -454,9 +496,13 @@ fn manager_outlives_executors_same_template_reused_then_shutdown_respawns() {
         &[("TEST_WRITE_PPID", "1")],
     );
     let r3 = exec_c.run(&job3).expect("job3 dispatch");
-    assert_eq!(r3.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&r3.stderr));
-    let ppid3 =
-        std::fs::read_to_string(root.path().join("log-3").join("stdout.txt")).unwrap();
+    assert_eq!(
+        r3.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&r3.stderr)
+    );
+    let ppid3 = std::fs::read_to_string(root.path().join("log-3").join("stdout.txt")).unwrap();
     assert_ne!(
         ppid1, ppid3,
         "after shutdown() the next dispatch must spawn a fresh template process"
@@ -497,8 +543,18 @@ fn template_key_includes_python_env_two_distinct_templates() {
 
     let ra = exec.run(&job_a).expect("job a dispatch");
     let rb = exec.run(&job_b).expect("job b dispatch");
-    assert_eq!(ra.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&ra.stderr));
-    assert_eq!(rb.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&rb.stderr));
+    assert_eq!(
+        ra.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&ra.stderr)
+    );
+    assert_eq!(
+        rb.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&rb.stderr)
+    );
 
     assert_eq!(
         manager.template_count(),

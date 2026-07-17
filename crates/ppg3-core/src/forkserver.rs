@@ -86,7 +86,7 @@ use serde_json::Value;
 use error_stack::{Report, ResultExt as _};
 
 use crate::error::Error;
-use crate::executor::{self, Executor, ExecResult, NoneExecutor, PreparedJob};
+use crate::executor::{self, ExecResult, Executor, NoneExecutor, PreparedJob};
 use crate::Result;
 
 // ============================================================ eligibility
@@ -234,7 +234,10 @@ fn reader_loop(mut reader: BufReader<std::process::ChildStdout>, waiters: Waiter
         };
         if let Some(exited) = v.get("exited") {
             let id = exited.get("id").and_then(|x| x.as_str());
-            let exit_code = exited.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(-1) as i32;
+            let exit_code = exited
+                .get("exit_code")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(-1) as i32;
             if let Some(id) = id {
                 let mut w = waiters.lock().unwrap();
                 if let Some(sender) = w.remove(id) {
@@ -357,7 +360,10 @@ impl TemplateManager {
         crate::hash::blake3_hex(bytes.as_bytes())[..16].to_string()
     }
 
-    fn spawn_template(&self, key: &TemplateKey) -> std::result::Result<Arc<Template>, Report<Error>> {
+    fn spawn_template(
+        &self,
+        key: &TemplateKey,
+    ) -> std::result::Result<Arc<Template>, Report<Error>> {
         std::fs::create_dir_all(&self.work_parent).map_err(|e| Error::io(&self.work_parent, e))?;
 
         let mut argv = vec![key.interpreter.clone()];
@@ -390,9 +396,9 @@ impl TemplateManager {
         let mut reader = BufReader::new(stdout);
 
         let mut first_line = String::new();
-        let read = reader.read_line(&mut first_line).map_err(|e| {
-            Error::Other(format!("template: reading ready line failed: {e}"))
-        })?;
+        let read = reader
+            .read_line(&mut first_line)
+            .map_err(|e| Error::Other(format!("template: reading ready line failed: {e}")))?;
         if read == 0 || first_line.trim().is_empty() {
             let _ = child.kill();
             let _ = child.wait();
@@ -406,10 +412,7 @@ impl TemplateManager {
                 argv[0],
             )))
             .attach(format!("full template log: {}", stderr_path.display()))
-            .attach(format!(
-                "template stderr tail:\n{}",
-                tail_lines(&log, 20)
-            )));
+            .attach(format!("template stderr tail:\n{}", tail_lines(&log, 20))));
         }
         let ready: Value = serde_json::from_str(first_line.trim()).map_err(|e| {
             Error::Other(format!(
@@ -487,7 +490,8 @@ impl TemplateManager {
         };
         if let Some(slot_arc) = slot_arc {
             let mut slot = slot_arc.lock().unwrap();
-            let matches_dead = matches!(&slot.template, Some(current) if Arc::ptr_eq(current, dead));
+            let matches_dead =
+                matches!(&slot.template, Some(current) if Arc::ptr_eq(current, dead));
             if matches_dead {
                 slot.template = None;
             }
@@ -784,7 +788,10 @@ mod tests {
     fn template_key_differs_by_python_env() {
         let a = template_key_for(&shim_job_with_env("/py", vec!["numpy"], "env-a")).unwrap();
         let b = template_key_for(&shim_job_with_env("/py", vec!["numpy"], "env-b")).unwrap();
-        assert_ne!(a, b, "same interpreter+preload but different python_env must differ");
+        assert_ne!(
+            a, b,
+            "same interpreter+preload but different python_env must differ"
+        );
     }
 
     #[test]
@@ -804,12 +811,15 @@ mod tests {
         let bin_true = {
             // no /bin/true on nixos.
             std::str::from_utf8(
-                &(
-            std::process::Command::new("which")
-                .arg("true")
-                .output()
-                .expect("failed to run `which true`")
-                .stdout)).expect("which true did not return utf-8").trim().to_string()
+                &(std::process::Command::new("which")
+                    .arg("true")
+                    .output()
+                    .expect("failed to run `which true`")
+                    .stdout),
+            )
+            .expect("which true did not return utf-8")
+            .trim()
+            .to_string()
         };
         let job = shim_job(&bin_true, vec![]);
         let result = exec.run(&job).unwrap();

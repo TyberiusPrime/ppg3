@@ -187,6 +187,18 @@ enum Command {
         #[arg(long)]
         diff: bool,
     },
+    /// Copy a generation's outputs into a plain directory of real, writable
+    /// files (dereferencing the store symlinks) — a folder you can edit,
+    /// archive, or hand off without the read-only store behind it.
+    Materialize {
+        /// Destination directory. Must not already exist.
+        dest: PathBuf,
+        /// Generation to materialize; defaults to the current one.
+        #[arg(long)]
+        generation: Option<u64>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
     /// blake3-hash files, in the same lowercase-hex form ppg3 uses for
     /// output hashes (`oh`). Handy for checking by hand whether a file
     /// matches a store entry. Output is `<hash>  <path>`, like `sha256sum`;
@@ -397,6 +409,14 @@ fn run(cli: Cli) -> Result<i32, AppError> {
         } => {
             let store = config::resolve_single_store(store.as_deref())?;
             cmd_diff_entries(&store, &oh1, &oh2, diff, json)
+        }
+        Command::Materialize {
+            dest,
+            generation,
+            project,
+        } => {
+            let project_dir = config::resolve_project_dir(project.as_deref())?;
+            cmd_materialize(&project_dir, generation, &dest, json)
         }
         Command::Blake3sum { paths } => cmd_blake3sum(&paths, json),
     }
@@ -810,6 +830,29 @@ fn cmd_rollback(project_dir: &Path, generation: Option<u64>, json: bool) -> Resu
         print_json(&serde_json::json!({"rolled_back_to": target}))?;
     } else {
         println!("rolled back to generation {target}");
+    }
+    Ok(0)
+}
+
+// ---- materialize ----
+
+fn cmd_materialize(
+    project_dir: &Path,
+    generation: Option<u64>,
+    dest: &Path,
+    json: bool,
+) -> Result<i32, AppError> {
+    let report = views::materialize(project_dir, generation, dest)?;
+    if json {
+        print_json(&report)?;
+    } else {
+        println!(
+            "materialized generation {} into {} ({} file(s), {} bytes)",
+            report.generation,
+            report.dest.display(),
+            report.files,
+            report.bytes,
+        );
     }
     Ok(0)
 }

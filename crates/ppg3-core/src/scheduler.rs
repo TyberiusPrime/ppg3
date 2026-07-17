@@ -87,19 +87,32 @@ pub struct JobDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputRef {
-    Job { id: String },
-    JobSubset { id: String, names: Vec<String> },
-    Leaf { hash: String },
+    Job {
+        id: String,
+    },
+    JobSubset {
+        id: String,
+        names: Vec<String>,
+    },
+    Leaf {
+        hash: String,
+    },
     /// A host file mounted read-only into the sandbox (`ppg3.File(...)`).
     /// `hash` is the content hash that gates staleness (its *only* input-key
     /// contribution — identical to `Leaf`, so it does not re-key existing
     /// jobs); `source` is the absolute host path bound at `/ppg/in/<name>`.
-    File { hash: String, source: String },
+    File {
+        hash: String,
+        source: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecTemplate {
-    Argv { argv: Vec<String>, allow_network: bool },
+    Argv {
+        argv: Vec<String>,
+        allow_network: bool,
+    },
     /// => host callback (`run_in_process`, or `expand_graph_job` when
     /// `JobDef.graph_job` is set). Produces no store entry.
     InProcess,
@@ -252,7 +265,10 @@ fn validate_and_index(
     let mut seen: HashSet<&str> = HashSet::new();
     for j in new_jobs {
         if !seen.insert(j.id.as_str()) {
-            return Err(Report::new(Error::Graph(format!("duplicate job id: {:?}", j.id))));
+            return Err(Report::new(Error::Graph(format!(
+                "duplicate job id: {:?}",
+                j.id
+            ))));
         }
         if existing_jobs.contains_key(&j.id) {
             return Err(Report::new(Error::Graph(format!(
@@ -281,8 +297,7 @@ fn validate_and_index(
                         j.id, pid
                     ))));
                 };
-                if matches!(
-            parent.exec_template, ExecTemplate::InProcess) {
+                if matches!(parent.exec_template, ExecTemplate::InProcess) {
                     return Err(Report::new(Error::Graph(format!(
                         "job {:?} references InProcess job {:?} as a store input (Job/JobSubset); \
                          InProcess jobs produce no store entry and can only be a scheduling barrier",
@@ -359,7 +374,9 @@ fn detect_cycle(jobs: &[JobDef]) -> Result<()> {
         }
     }
     if visited != jobs.len() {
-        return Err(Report::new(Error::Graph("cycle detected in job graph".to_string())));
+        return Err(Report::new(Error::Graph(
+            "cycle detected in job graph".to_string(),
+        )));
     }
     Ok(())
 }
@@ -434,7 +451,11 @@ fn insert_job(state: &mut State, job: JobDef) {
             }
             _ => remaining += 1,
         }
-        state.dependents.entry(p.clone()).or_default().push(id.clone());
+        state
+            .dependents
+            .entry(p.clone())
+            .or_default()
+            .push(id.clone());
     }
     state.jobs.insert(id.clone(), job);
     state.remaining_parents.insert(id.clone(), remaining);
@@ -478,7 +499,10 @@ fn complete_success(state: &mut State, id: &str) {
 /// still get the cascade once they finish, via the normal completion path
 /// — or immediately here if they too are still Pending/Ready).
 fn fail_job(state: &mut State, id: &str, reason: String, detail: Option<FailedJob>) {
-    if matches!(state.status.get(id), Some(Status::Done) | Some(Status::Failed)) {
+    if matches!(
+        state.status.get(id),
+        Some(Status::Done) | Some(Status::Failed)
+    ) {
         return;
     }
     state.status.insert(id.to_string(), Status::Failed);
@@ -496,7 +520,10 @@ fn fail_job(state: &mut State, id: &str, reason: String, detail: Option<FailedJo
     state.ready.retain(|x| x != id);
     if let Some(children) = state.dependents.get(id).cloned() {
         for c in children {
-            if matches!(state.status.get(&c), Some(Status::Pending) | Some(Status::Ready)) {
+            if matches!(
+                state.status.get(&c),
+                Some(Status::Pending) | Some(Status::Ready)
+            ) {
                 fail_job(state, &c, format!("upstream failed: {id}"), None);
             }
         }
@@ -635,7 +662,10 @@ fn dispatch_argv_job(
     }
 
     let (argv_template, allow_network) = match &job.exec_template {
-        ExecTemplate::Argv { argv, allow_network } => (argv, *allow_network),
+        ExecTemplate::Argv {
+            argv,
+            allow_network,
+        } => (argv, *allow_network),
         ExecTemplate::InProcess => unreachable!("InProcess handled by the caller"),
     };
 
@@ -715,14 +745,8 @@ fn dispatch_argv_job(
             // with locations + backtrace); color is disabled globally at the
             // top of `run()` so this stays clean in a file.
             let rendered = format!("{report:?}");
-            let failure_log = executor::write_failure_log(
-                &log_dir,
-                &job.id,
-                None,
-                Some(&rendered),
-                b"",
-                b"",
-            );
+            let failure_log =
+                executor::write_failure_log(&log_dir, &job.id, None, Some(&rendered), b"", b"");
             let reason = format!(
                 "job {:?} failed to execute (ppg3-core error):\n{}",
                 job.id, rendered
@@ -842,22 +866,52 @@ fn dispatch_argv_job(
 
 fn apply_outcome(shared: &Shared, state: &mut State, id: &str, outcome: JobOutcome) {
     match outcome {
-        JobOutcome::Hit { ik, oh, content, store_idx } => {
+        JobOutcome::Hit {
+            ik,
+            oh,
+            content,
+            store_idx,
+        } => {
             state.report.hits.push(id.to_string());
-            state.report.job_entries.insert(id.to_string(), (ik.clone(), oh.clone()));
+            state
+                .report
+                .job_entries
+                .insert(id.to_string(), (ik.clone(), oh.clone()));
             if let Some(lease) = &shared.run_lease {
                 let _ = lease.protect(&oh);
             }
-            state.completed.insert(id.to_string(), CompletedInfo { oh, content, store_idx });
+            state.completed.insert(
+                id.to_string(),
+                CompletedInfo {
+                    oh,
+                    content,
+                    store_idx,
+                },
+            );
             complete_success(state, id);
         }
-        JobOutcome::Built { ik, oh, content, store_idx } => {
+        JobOutcome::Built {
+            ik,
+            oh,
+            content,
+            store_idx,
+        } => {
             state.report.built.push(id.to_string());
-            state.report.job_entries.insert(id.to_string(), (ik.clone(), oh.clone()));
+            state
+                .report
+                .job_entries
+                .insert(id.to_string(), (ik.clone(), oh.clone()));
             if let Some(lease) = &shared.run_lease {
                 let _ = lease.protect(&oh);
             }
-            state.completed.insert(id.to_string(), CompletedInfo { oh, content, store_idx });
+            state.completed.insert(
+                id.to_string(),
+                CompletedInfo {
+                    oh,
+                    content,
+                    store_idx,
+                },
+            );
             complete_success(state, id);
         }
         JobOutcome::InProcessDone => {
@@ -952,7 +1006,12 @@ fn derive_key(
         .iter()
         .map(|(k, v)| (k.clone(), Value::String(v.clone())))
         .collect();
-    let outputs_val: Vec<Value> = job.outputs_declared.iter().cloned().map(Value::String).collect();
+    let outputs_val: Vec<Value> = job
+        .outputs_declared
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect();
 
     let doc = serde_json::json!({
         "ppg3_key_version": crate::KEY_VERSION,
@@ -983,7 +1042,11 @@ fn lower_argv(
         .collect()
 }
 
-fn lower_token(s: &str, job: &JobDef, completed: &HashMap<String, CompletedInfo>) -> Result<String> {
+fn lower_token(
+    s: &str,
+    job: &JobDef,
+    completed: &HashMap<String, CompletedInfo>,
+) -> Result<String> {
     let mut out = String::new();
     let mut rest = s;
     while let Some(start) = rest.find('{') {
@@ -1143,7 +1206,10 @@ mod tests {
             resources: BTreeMap::new(),
             store_target: None,
             retain: Retain::Default,
-            exec_template: ExecTemplate::Argv { argv: vec!["/bin/true".to_string()], allow_network: false },
+            exec_template: ExecTemplate::Argv {
+                argv: vec!["/bin/true".to_string()],
+                allow_network: false,
+            },
             view: BTreeMap::new(),
             fixed_output: None,
             graph_job: false,
@@ -1159,9 +1225,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_duplicate_ids() {
-        let jobs = vec![argv_job("a", BTreeMap::new()), argv_job("a", BTreeMap::new())];
+        let jobs = vec![
+            argv_job("a", BTreeMap::new()),
+            argv_job("a", BTreeMap::new()),
+        ];
         assert!(matches!(
-            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()).as_ref().map_err(|r| r.current_context()),
+            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new())
+                .as_ref()
+                .map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1169,10 +1240,17 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_dep() {
         let mut inputs = BTreeMap::new();
-        inputs.insert("x".to_string(), InputRef::Job { id: "missing".to_string() });
+        inputs.insert(
+            "x".to_string(),
+            InputRef::Job {
+                id: "missing".to_string(),
+            },
+        );
         let jobs = vec![argv_job("a", inputs)];
         assert!(matches!(
-            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()).as_ref().map_err(|r| r.current_context()),
+            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new())
+                .as_ref()
+                .map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1180,12 +1258,24 @@ mod tests {
     #[test]
     fn validate_rejects_cycle() {
         let mut i_a = BTreeMap::new();
-        i_a.insert("x".to_string(), InputRef::Job { id: "b".to_string() });
+        i_a.insert(
+            "x".to_string(),
+            InputRef::Job {
+                id: "b".to_string(),
+            },
+        );
         let mut i_b = BTreeMap::new();
-        i_b.insert("x".to_string(), InputRef::Job { id: "a".to_string() });
+        i_b.insert(
+            "x".to_string(),
+            InputRef::Job {
+                id: "a".to_string(),
+            },
+        );
         let jobs = vec![argv_job("a", i_a), argv_job("b", i_b)];
         assert!(matches!(
-            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new()).as_ref().map_err(|r| r.current_context()),
+            validate_and_index(&jobs, &HashMap::new(), &BTreeMap::new())
+                .as_ref()
+                .map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1194,10 +1284,17 @@ mod tests {
     fn validate_rejects_inprocess_as_job_input() {
         let producer = in_process_job("p", BTreeMap::new(), false);
         let mut inputs = BTreeMap::new();
-        inputs.insert("x".to_string(), InputRef::Job { id: "p".to_string() });
+        inputs.insert(
+            "x".to_string(),
+            InputRef::Job {
+                id: "p".to_string(),
+            },
+        );
         let consumer = argv_job("c", inputs);
         assert!(matches!(
-            validate_and_index(&[producer, consumer], &HashMap::new(), &BTreeMap::new()).as_ref().map_err(|r| r.current_context()),
+            validate_and_index(&[producer, consumer], &HashMap::new(), &BTreeMap::new())
+                .as_ref()
+                .map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1209,13 +1306,17 @@ mod tests {
         let mut caps = BTreeMap::new();
         caps.insert("cores".to_string(), 4);
         assert!(matches!(
-            validate_and_index(std::slice::from_ref(&j), &HashMap::new(), &caps).as_ref().map_err(|r| r.current_context()),
+            validate_and_index(std::slice::from_ref(&j), &HashMap::new(), &caps)
+                .as_ref()
+                .map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
         let mut j2 = argv_job("a", BTreeMap::new());
         j2.resources.insert("gpu".to_string(), 1);
         assert!(matches!(
-            validate_and_index(std::slice::from_ref(&j2), &HashMap::new(), &caps).as_ref().map_err(|r| r.current_context()),
+            validate_and_index(std::slice::from_ref(&j2), &HashMap::new(), &caps)
+                .as_ref()
+                .map_err(|r| r.current_context()),
             Err(Error::Graph(_))
         ));
     }
@@ -1224,12 +1325,27 @@ mod tests {
     fn validate_accepts_valid_diamond() {
         let a = argv_job("a", BTreeMap::new());
         let mut i_b = BTreeMap::new();
-        i_b.insert("a".to_string(), InputRef::Job { id: "a".to_string() });
+        i_b.insert(
+            "a".to_string(),
+            InputRef::Job {
+                id: "a".to_string(),
+            },
+        );
         let b = argv_job("b", i_b.clone());
         let c = argv_job("c", i_b);
         let mut i_d = BTreeMap::new();
-        i_d.insert("b".to_string(), InputRef::Job { id: "b".to_string() });
-        i_d.insert("c".to_string(), InputRef::Job { id: "c".to_string() });
+        i_d.insert(
+            "b".to_string(),
+            InputRef::Job {
+                id: "b".to_string(),
+            },
+        );
+        i_d.insert(
+            "c".to_string(),
+            InputRef::Job {
+                id: "c".to_string(),
+            },
+        );
         let d = argv_job("d", i_d);
         assert!(validate_and_index(&[a, b, c, d], &HashMap::new(), &BTreeMap::new()).is_ok());
     }
@@ -1249,7 +1365,11 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(
             id.to_string(),
-            CompletedInfo { oh: "oh".to_string(), content, store_idx: 0 },
+            CompletedInfo {
+                oh: "oh".to_string(),
+                content,
+                store_idx: 0,
+            },
         );
         m
     }
@@ -1258,13 +1378,21 @@ mod tests {
     fn lower_token_out_placeholder() {
         let job = argv_job("a", BTreeMap::new());
         let completed = HashMap::new();
-        assert_eq!(lower_token("{out}/x.txt", &job, &completed).unwrap(), "/ppg/out/x.txt");
+        assert_eq!(
+            lower_token("{out}/x.txt", &job, &completed).unwrap(),
+            "/ppg/out/x.txt"
+        );
     }
 
     #[test]
     fn lower_token_in_placeholder_single_file_points_at_file() {
         let mut inputs = BTreeMap::new();
-        inputs.insert("data".to_string(), InputRef::Job { id: "p".to_string() });
+        inputs.insert(
+            "data".to_string(),
+            InputRef::Job {
+                id: "p".to_string(),
+            },
+        );
         let job = argv_job("a", inputs);
         let completed = completed_with("p", &["only.txt"]);
         assert_eq!(
@@ -1276,10 +1404,18 @@ mod tests {
     #[test]
     fn lower_token_in_placeholder_multi_file_points_at_dir() {
         let mut inputs = BTreeMap::new();
-        inputs.insert("data".to_string(), InputRef::Job { id: "p".to_string() });
+        inputs.insert(
+            "data".to_string(),
+            InputRef::Job {
+                id: "p".to_string(),
+            },
+        );
         let job = argv_job("a", inputs);
         let completed = completed_with("p", &["a.txt", "b.txt"]);
-        assert_eq!(lower_token("{in:data}", &job, &completed).unwrap(), "/ppg/in/data");
+        assert_eq!(
+            lower_token("{in:data}", &job, &completed).unwrap(),
+            "/ppg/in/data"
+        );
     }
 
     #[test]
@@ -1290,7 +1426,10 @@ mod tests {
         let mut inputs = BTreeMap::new();
         inputs.insert(
             "raw".to_string(),
-            InputRef::File { hash: "ab".repeat(32), source: "/data/raw.txt".to_string() },
+            InputRef::File {
+                hash: "ab".repeat(32),
+                source: "/data/raw.txt".to_string(),
+            },
         );
         let job = argv_job("a", inputs);
         assert_eq!(
@@ -1304,10 +1443,17 @@ mod tests {
         // A pure Leaf (a Params value) has no mount; asking for its path is a
         // job-definition error, not a silent empty string.
         let mut inputs = BTreeMap::new();
-        inputs.insert("cfg".to_string(), InputRef::Leaf { hash: "deadbeef".to_string() });
+        inputs.insert(
+            "cfg".to_string(),
+            InputRef::Leaf {
+                hash: "deadbeef".to_string(),
+            },
+        );
         let job = argv_job("a", inputs);
         assert!(matches!(
-            lower_token("{in:cfg}", &job, &HashMap::new()).as_ref().map_err(|r| r.current_context()),
+            lower_token("{in:cfg}", &job, &HashMap::new())
+                .as_ref()
+                .map_err(|r| r.current_context()),
             Err(Error::JobFailed(_))
         ));
     }
@@ -1325,11 +1471,17 @@ mod tests {
         let mut file_inputs = BTreeMap::new();
         file_inputs.insert(
             "x".to_string(),
-            InputRef::File { hash: h.clone(), source: "/anywhere/on/disk.txt".to_string() },
+            InputRef::File {
+                hash: h.clone(),
+                source: "/anywhere/on/disk.txt".to_string(),
+            },
         );
         let (fdoc, file_ik) = derive_key(&argv_job("a", file_inputs), &HashMap::new()).unwrap();
 
-        assert_eq!(file_ik, leaf_ik, "File must key identically to an equal Leaf");
+        assert_eq!(
+            file_ik, leaf_ik,
+            "File must key identically to an equal Leaf"
+        );
         // The source path must never leak into the key document.
         assert_eq!(fdoc["inputs"]["x"], serde_json::json!("c0ffee"));
     }
@@ -1337,7 +1489,8 @@ mod tests {
     #[test]
     fn lower_token_tool_placeholder() {
         let mut job = argv_job("a", BTreeMap::new());
-        job.tools.insert("py".to_string(), "/nix/store/xyz-py".to_string());
+        job.tools
+            .insert("py".to_string(), "/nix/store/xyz-py".to_string());
         assert_eq!(
             lower_token("{tool:py}/bin/python3", &job, &HashMap::new()).unwrap(),
             "/ppg/tools/py/bin/python3"
@@ -1350,7 +1503,8 @@ mod tests {
         // publish destination (job.view) must never shape the bytes.
         let mut job = argv_job("a", BTreeMap::new());
         job.outputs_declared.push("result".to_string());
-        job.view.insert("result".to_string(), "results/x.tsv".to_string());
+        job.view
+            .insert("result".to_string(), "results/x.tsv".to_string());
         assert_eq!(
             lower_token("{out:result}", &job, &HashMap::new()).unwrap(),
             "/ppg/out/result"
@@ -1361,7 +1515,9 @@ mod tests {
     fn lower_token_unknown_out_named_is_job_failed() {
         let job = argv_job("a", BTreeMap::new());
         assert!(matches!(
-            lower_token("{out:nope}", &job, &HashMap::new()).as_ref().map_err(|r| r.current_context()),
+            lower_token("{out:nope}", &job, &HashMap::new())
+                .as_ref()
+                .map_err(|r| r.current_context()),
             Err(Error::JobFailed(_))
         ));
     }
@@ -1369,7 +1525,8 @@ mod tests {
     #[test]
     fn build_env_baseline_then_declared_overrides() {
         let mut job = argv_job("a", BTreeMap::new());
-        job.env.insert("HOME".to_string(), "/custom/home".to_string());
+        job.env
+            .insert("HOME".to_string(), "/custom/home".to_string());
         job.env.insert("MY_VAR".to_string(), "1".to_string());
         let env = build_env(&job);
         assert_eq!(env.get("HOME").unwrap(), "/custom/home");
@@ -1383,8 +1540,18 @@ mod tests {
     #[test]
     fn derive_key_produces_canonical_document() {
         let mut inputs = BTreeMap::new();
-        inputs.insert("data".to_string(), InputRef::Job { id: "p".to_string() });
-        inputs.insert("leaf".to_string(), InputRef::Leaf { hash: "deadbeef".to_string() });
+        inputs.insert(
+            "data".to_string(),
+            InputRef::Job {
+                id: "p".to_string(),
+            },
+        );
+        inputs.insert(
+            "leaf".to_string(),
+            InputRef::Leaf {
+                hash: "deadbeef".to_string(),
+            },
+        );
         let job = argv_job("a", inputs);
         let completed = completed_with("p", &["only.txt"]);
         let (doc, ik) = derive_key(&job, &completed).unwrap();
@@ -1399,7 +1566,10 @@ mod tests {
         let mut inputs = BTreeMap::new();
         inputs.insert(
             "data".to_string(),
-            InputRef::JobSubset { id: "p".to_string(), names: vec!["missing.txt".to_string()] },
+            InputRef::JobSubset {
+                id: "p".to_string(),
+                names: vec!["missing.txt".to_string()],
+            },
         );
         let job = argv_job("a", inputs);
         let completed = completed_with("p", &["only.txt"]);

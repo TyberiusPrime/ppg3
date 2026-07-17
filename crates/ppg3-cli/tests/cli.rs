@@ -158,6 +158,60 @@ fn generations_command_finds_ppg3_walking_up_from_subdirectory() {
 }
 
 #[test]
+fn materialize_exports_a_real_file_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (project_root, project_dir, store) = setup_project(tmp.path());
+    let oh = publish(
+        &store,
+        &"9".repeat(64),
+        &simple_doc("r1"),
+        &[("out.txt", b"hello materialize")],
+    );
+    let stores = StoreSet::new(vec![store]);
+    views::write_generation(
+        &project_dir,
+        "proj",
+        &stores,
+        &one_entry_spec("out.txt", oh),
+        false,
+    )
+    .unwrap();
+
+    let dest = tmp.path().join("exported");
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .arg("materialize")
+        .arg(&dest)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("materialized generation 1"));
+
+    let out_file = dest.join("out.txt");
+    assert_eq!(
+        std::fs::read_to_string(&out_file).unwrap(),
+        "hello materialize"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&out_file)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "materialized output must be a real file, not a symlink"
+    );
+
+    // A second run at the same dest is refused (operational error, code 1).
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .arg("materialize")
+        .arg(&dest)
+        .assert()
+        .failure()
+        .code(1);
+}
+
+#[test]
 fn explain_reports_first_appearance_then_diff() {
     let tmp = tempfile::tempdir().unwrap();
     let (project_root, project_dir, store) = setup_project(tmp.path());

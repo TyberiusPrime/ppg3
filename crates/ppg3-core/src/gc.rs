@@ -351,7 +351,11 @@ fn sweep_orphan_logs(store: &Store, policy: &GcPolicy, report: &mut GcReport) ->
         }
         let link_path = store.inputs_dir().join(&ik);
         let has_live_entry = match std::fs::read_link(&link_path) {
-            Ok(target) => link_path.parent().expect("inputs dir").join(&target).exists(),
+            Ok(target) => link_path
+                .parent()
+                .expect("inputs dir")
+                .join(&target)
+                .exists(),
             Err(_) => false,
         };
         if has_live_entry {
@@ -409,7 +413,12 @@ fn clean_stale_lease_files(
     policy: &GcPolicy,
     report: &mut GcReport,
 ) -> Result<(), Error> {
-    clean_stale_json(&store.leases_dir(), LEASE_STALE_AFTER, policy, &mut report.removed_leases)
+    clean_stale_json(
+        &store.leases_dir(),
+        LEASE_STALE_AFTER,
+        policy,
+        &mut report.removed_leases,
+    )
 }
 
 fn clean_stale_intent_files(
@@ -599,7 +608,9 @@ mod tests {
         let leased = publish(&store, &"3".repeat(64), b"leased", false);
         let unrooted = publish(&store, &"4".repeat(64), b"gone", false);
 
-        store.add_root("proj", 1, &[rooted.oh().to_string()]).unwrap();
+        store
+            .add_root("proj", 1, &[rooted.oh().to_string()])
+            .unwrap();
         store.pin("release", pinned.oh()).unwrap();
         let lease = store.lease("run1").unwrap();
         lease.protect(leased.oh()).unwrap();
@@ -612,7 +623,10 @@ mod tests {
             .unwrap();
 
         assert!(store.entry_dir(rooted.oh()).exists());
-        assert!(store.entry_dir(pinned.oh()).exists(), "pins survive aggressive");
+        assert!(
+            store.entry_dir(pinned.oh()).exists(),
+            "pins survive aggressive"
+        );
         assert!(store.entry_dir(leased.oh()).exists());
         assert!(!store.entry_dir(unrooted.oh()).exists());
         assert!(report.removed_entries.contains(&unrooted.oh().to_string()));
@@ -862,7 +876,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open("s", dir.path(), false).unwrap();
         let rooted = publish(&store, &"1".repeat(64), b"keep-this-content-rooted", false);
-        store.add_root("proj", 1, &[rooted.oh().to_string()]).unwrap();
+        store
+            .add_root("proj", 1, &[rooted.oh().to_string()])
+            .unwrap();
 
         // Log for the *rooted* ik, so it is not an orphan (won't be swept by
         // the orphan pass) — only budget eviction can remove it.
@@ -882,7 +898,10 @@ mod tests {
             })
             .unwrap();
 
-        assert!(store.entry_dir(rooted.oh()).exists(), "rooted entry survives");
+        assert!(
+            store.entry_dir(rooted.oh()).exists(),
+            "rooted entry survives"
+        );
         assert!(!log_dir.exists(), "logs evicted to make budget");
         assert!(!report.removed_logs.is_empty());
         assert!(report.removed_entries.is_empty());
@@ -902,7 +921,10 @@ mod tests {
         let report = store.gc(&default_policy(Some(one_entry_size))).unwrap();
 
         assert!(!store.entry_dir(old.oh()).exists(), "older evicted first");
-        assert!(store.entry_dir(newer.oh()).exists(), "recently-hit survives");
+        assert!(
+            store.entry_dir(newer.oh()).exists(),
+            "recently-hit survives"
+        );
         assert!(report.removed_entries.contains(&old.oh().to_string()));
     }
 

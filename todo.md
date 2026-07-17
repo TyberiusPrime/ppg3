@@ -35,6 +35,8 @@ Open:
 - what's in todo?
 
 -- when no writeable store is defined, fail early, not at every damn job
+  [RESOLVED — `ppg3.run` raises once, before dispatch, when no writable
+   store is configured (PRINCIPLES.md P3.1, run.py). Verified in source.]
 
 -- we are corrently loosing the file names on our python tracebacks. Add those back in.
   [RESOLVED — frames carry their real filename again; and the `_shim.py`
@@ -73,6 +75,8 @@ Open:
    project's generations/outputs (pointers into the store).]
 
 - the 'no output on job fail' thing is idiotic. We should build as much as possible.
+  [RESOLVED — every job that finishes still publishes; a failure only stops
+   the view swap. Finished outputs are browsable under `partial/` (P8.2).]
 
 - should we even have a new generation if output == output, and change_id==change_id?
 
@@ -118,6 +122,10 @@ b) no reference to the two folders involved
 c) why is it logging the mode
 d) no clear 'this is what happend' message
 e) what jobs is it talking about?
+  [RESOLVED — `Store::diff_report` now opens with "the same inputs (memo
+   link ...) produced two different outputs", names both the previous-entry
+   and this-build directories, lists added/removed/changed files, and ends
+   with the `ppg3 diff-entries` command to dig further. Verified in source.]
 
 
 
@@ -137,6 +145,10 @@ ppg3._shim: fetch hash mismatch for https://raw.githubusercontent.com/TyberiusPr
 
 Good: We got the url. Bad: Neither the store/entries we're comparing against,
 nor the downloaded version is present.
+  [RESOLVED — `_shim.run_fetch` now reports the url, both hashes (labelled
+   pinned/old vs freshly-downloaded), and the absolute path where the
+   rejected download was kept for diffing. Tested by P7.4/P9.3
+   (test_p07_fetch.py). Verified.]
 
 
 
@@ -148,6 +160,10 @@ ppg3.run()
 
 That's awful. The user wants to inspect job outputs as they're done,
 not after a multi day run...
+  [RESOLVED — the view stays all-or-nothing (P8.3), but every *finished*
+   job's outputs are now linked into `<project_dir>/partial/` on a failed
+   run (P8.2, run.py `_write_partial_tree`), and `format_failures` points at
+   it. Inspect partial results without store archaeology. Verified.]
 
 
 And the report sucks.
@@ -261,6 +277,10 @@ hell, even changing the hash doesn't trigger anything!
 (and changing the url should trigger a refetch, even if we have 
 a matching hash. most of the time it's a case of 'the user forgot to change the hash',
 worst case it's a redownload, not a 'and we updated all the urls').
+  [RESOLVED — a fetch's identity is (url, pin): the pin rides in the recipe
+   hash and the url is a leaf input, so changing either forces a refetch;
+   removing the pin gives a one-shot key that never memo-hits. Covered by
+   P7.1/P7.2/P7.3 in test_p07_fetch.py. Verified.]
 
 
 -- we need a ppg3 blake3sum command

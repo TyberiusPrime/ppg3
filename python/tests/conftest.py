@@ -10,6 +10,17 @@ sys.path.insert(0, str(PYTHON_DIR))
 GOLDEN_DIR = PYTHON_DIR.parent / "tests" / "golden"
 
 
+def pytest_configure(config):
+    # Used by the principles suite (tests/principles/, see its README.md);
+    # registered here because a second conftest.py under principles/ would
+    # shadow this one for `from conftest import ...` in sibling test files.
+    config.addinivalue_line(
+        "markers",
+        "principle(ids): binds a test to invariant id(s) from "
+        "python/tests/principles/invariants.json",
+    )
+
+
 def _has_module(name: str) -> bool:
     try:
         __import__(name)

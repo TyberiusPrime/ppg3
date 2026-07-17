@@ -12,13 +12,56 @@ mod config;
 
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use ppg3_core::explain::{self, Explanation};
-use ppg3_core::gc::GcPolicy;
+use ppg3_core::gc::{GcLevel, GcPolicy};
 use ppg3_core::store::Store;
 use ppg3_core::views;
+
+/// CLI spelling of [`GcLevel`] (§11.2). Kebab-case on the command line;
+/// `--level default` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum CliGcLevel {
+    /// Debris + orphan logs only (post-mortem cleanup of a bad run).
+    FailedOnly,
+    /// + evict-marked entries and dangling input links.
+    Minimal,
+    /// + budget-driven LRU sweep of unrooted entries (needs --max-size).
+    #[default]
+    Default,
+    /// + sweep every unrooted entry; drop ephemeral/op-log generations.
+    Aggressive,
+    /// Drop all but the current generation and clear pins, as if the last run
+    /// were the only thing that ever happened here. Requires --yes.
+    Reset,
+}
+
+impl CliGcLevel {
+    fn core(self) -> GcLevel {
+        match self {
+            CliGcLevel::FailedOnly => GcLevel::FailedOnly,
+            CliGcLevel::Minimal => GcLevel::Minimal,
+            CliGcLevel::Default => GcLevel::Default,
+            CliGcLevel::Aggressive => GcLevel::Aggressive,
+            CliGcLevel::Reset => GcLevel::Reset,
+        }
+    }
+}
+
+/// `--min-age` grace for the default-level budget sweep, given in days.
+fn parse_min_age_days(s: &str) -> Result<i64, String> {
+    let days: f64 = s
+        .trim()
+        .trim_end_matches('d')
+        .parse()
+        .map_err(|e| format!("invalid --min-age {s:?}: {e}"))?;
+    if days < 0.0 {
+        return Err(format!("--min-age must be non-negative, got {days}"));
+    }
+    Ok((days * 24.0 * 60.0 * 60.0 * 1000.0) as i64)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -79,26 +122,39 @@ enum Command {
     /// 2. mark/sweep every writable store in `.ppg3/config.json` so the
     ///    entries those roots kept alive are actually reclaimed.
     Gc {
+        /// How aggressively to reclaim (§11.2). `default` keeps the
+        /// constructive-trace promise; `aggressive` reclaims every unrooted
+        /// entry; `reset` leaves the store as if only the current generation
+        /// ever ran (drops all other generations + pins; needs --yes).
+        #[arg(long, value_enum, default_value_t = CliGcLevel::Default)]
+        level: CliGcLevel,
         /// How many old committed (or VCS-less) generations to keep, in
-        /// addition to the current one.
+        /// addition to the current one (`default` level only; `aggressive`
+        /// keeps all committed, `reset` keeps none).
         #[arg(long, default_value_t = 10)]
         keep: u64,
         /// How many old op-log/ephemeral generations to keep (dirty jj
         /// working copy at run time, or watch-mode ephemeral) — their
         /// source state is not durably committed, so the default is
-        /// deliberately smaller.
+        /// deliberately smaller. `default` level only.
         #[arg(long, default_value_t = 2)]
         keep_oplog: u64,
-        /// Store sweep budget; without it phase 2 still removes
-        /// evict-marked entries and dangling input links.
+        /// Store sweep budget (bytes) for the `default` level.
         #[arg(long)]
         max_size: Option<u64>,
+        /// `default`-level grace: keep unrooted entries touched within this
+        /// many days even when over budget (e.g. `7` or `7d`).
+        #[arg(long, value_parser = parse_min_age_days)]
+        min_age: Option<i64>,
         /// Allow phase 2 to evict `logs/` under budget pressure.
         #[arg(long)]
         evict_logs: bool,
         /// Report both phases without deleting anything.
         #[arg(long)]
         dry_run: bool,
+        /// Required confirmation for `--level reset` (drops generations + pins).
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         project: Option<PathBuf>,
     },
@@ -129,20 +185,38 @@ enum Command {
 
 #[derive(Subcommand)]
 enum StoreCmd {
-    /// Mark/sweep GC on a single store.
+    /// Mark/sweep GC on a single store (no project — see §11.2 for how the
+    /// levels behave without generations to drop).
     Gc {
+        /// Reclaim level (§11.2). `reset` clears this store's pins and
+        /// requires --yes; generation dropping is a project concern (`ppg3 gc`).
+        #[arg(long, value_enum, default_value_t = CliGcLevel::Default)]
+        level: CliGcLevel,
         #[arg(long)]
         max_size: Option<u64>,
+        /// `default`-level grace, in days (see `ppg3 gc --min-age`).
+        #[arg(long, value_parser = parse_min_age_days)]
+        min_age: Option<i64>,
         #[arg(long)]
         store: PathBuf,
         #[arg(long)]
         dry_run: bool,
-        /// Additive beyond the WP5 brief's flag list (documented in
-        /// STATUS.md): allow GC to evict `logs/` under budget pressure,
-        /// matching `GcPolicy.evict_logs` (opt-in per WP1's gc.rs module
-        /// doc — logs are valuable debugging data, not swept by default).
+        /// Allow GC to evict `logs/` under budget pressure.
         #[arg(long)]
         evict_logs: bool,
+        /// Required confirmation for `--level reset` (clears pins).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete the entire store (§11.3). Entries are read-only, so `rm -rf`
+    /// fails half-way; this restores write permission and removes it. The
+    /// store is truth (P3), so this is deliberately explicit and --yes-gated.
+    Nuke {
+        #[arg(long)]
+        store: PathBuf,
+        /// Required confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// Rehash entries and compare against their manifest.
     Verify {
@@ -215,11 +289,15 @@ fn run(cli: Cli) -> Result<i32, AppError> {
     match cli.command {
         Command::Store { cmd } => match cmd {
             StoreCmd::Gc {
+                level,
                 max_size,
+                min_age,
                 store,
                 dry_run,
                 evict_logs,
-            } => cmd_store_gc(&store, max_size, dry_run, evict_logs, json),
+                yes,
+            } => cmd_store_gc(&store, level, max_size, min_age, dry_run, evict_logs, yes, json),
+            StoreCmd::Nuke { store, yes } => cmd_store_nuke(&store, yes, json),
             StoreCmd::Verify {
                 sample,
                 entry,
@@ -248,21 +326,27 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             }
         },
         Command::Gc {
+            level,
             keep,
             keep_oplog,
             max_size,
+            min_age,
             evict_logs,
             dry_run,
+            yes,
             project,
         } => {
             let project_dir = config::resolve_project_dir(project.as_deref())?;
             cmd_gc(
                 &project_dir,
+                level,
                 keep,
                 keep_oplog,
                 max_size,
+                min_age,
                 evict_logs,
                 dry_run,
+                yes,
                 json,
             )
         }
@@ -295,16 +379,27 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), AppError> {
 
 // ---- store gc ----
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_store_gc(
     store_path: &Path,
+    level: CliGcLevel,
     max_size: Option<u64>,
+    min_age: Option<i64>,
     dry_run: bool,
     evict_logs: bool,
+    yes: bool,
     json: bool,
 ) -> Result<i32, AppError> {
+    if level == CliGcLevel::Reset && !yes {
+        return Err(AppError::Usage(
+            "store gc --level reset clears this store's pins; pass --yes to confirm".to_string(),
+        ));
+    }
     let store = Store::open(&store_display_name(store_path), store_path, false)?;
     let policy = GcPolicy {
+        level: level.core(),
         max_size,
+        min_age_ms: min_age,
         evict_logs,
         dry_run,
     };
@@ -312,20 +407,62 @@ fn cmd_store_gc(
     if json {
         print_json(&report)?;
     } else {
-        println!(
-            "{}removed {} entries, {} logs, {} dangling input link(s); freed {} bytes, {} bytes remaining",
-            if report.dry_run { "[dry-run] " } else { "" },
-            report.removed_entries.len(),
-            report.removed_logs.len(),
-            report.removed_dangling_inputs.len(),
-            report.bytes_freed,
-            report.remaining_size,
-        );
+        print_store_report_human("", &report);
         for oh in &report.removed_entries {
             println!("  removed entry {oh}");
         }
     }
     Ok(0)
+}
+
+fn cmd_store_nuke(store_path: &Path, yes: bool, json: bool) -> Result<i32, AppError> {
+    if !yes {
+        return Err(AppError::Usage(format!(
+            "store nuke deletes the entire store at {store_path:?} (all built content); \
+             pass --yes to confirm"
+        )));
+    }
+    let store = Store::open(&store_display_name(store_path), store_path, false)?;
+    store.nuke()?;
+    if json {
+        print_json(&serde_json::json!({"nuked": store_path.display().to_string()}))?;
+    } else {
+        println!("nuked store {}", store_path.display());
+    }
+    Ok(0)
+}
+
+/// Shared human formatter for a single store's [`GcReport`], used by both
+/// `store gc` and each store line of the project `gc`.
+fn print_store_report_human(prefix: &str, r: &ppg3_core::gc::GcReport) {
+    let dry = if r.dry_run { "[dry-run] " } else { "" };
+    println!(
+        "{prefix}{dry}removed {} entries, {} log dir(s), {} dangling input link(s); \
+         freed {} bytes, {} remaining",
+        r.removed_entries.len(),
+        r.removed_logs.len(),
+        r.removed_dangling_inputs.len(),
+        r.bytes_freed,
+        r.remaining_size,
+    );
+    let debris = r.removed_staging.len()
+        + r.removed_leases.len()
+        + r.removed_intents.len()
+        + r.removed_violations.len();
+    if debris > 0 || !r.removed_pins.is_empty() {
+        println!(
+            "{prefix}{dry}debris: {} staging, {} lease(s), {} intent(s), {} violation(s){}",
+            r.removed_staging.len(),
+            r.removed_leases.len(),
+            r.removed_intents.len(),
+            r.removed_violations.len(),
+            if r.removed_pins.is_empty() {
+                String::new()
+            } else {
+                format!("; cleared {} pin(s)", r.removed_pins.len())
+            },
+        );
+    }
 }
 
 // ---- store verify ----
@@ -411,24 +548,64 @@ struct GcCombinedReport {
     skipped_readonly_stores: Vec<String>,
 }
 
+/// Per-bucket generation-keep budgets a level implies (§11.2a). `None` = skip
+/// the generation phase entirely (`failed-only`/`minimal` don't drop
+/// generations). `default` uses the `--keep`/`--keep-oplog` flags; the
+/// stronger levels override them to force their retention shape.
+fn generation_budgets(level: CliGcLevel, keep: u64, keep_oplog: u64) -> Option<(u64, u64)> {
+    match level {
+        CliGcLevel::FailedOnly | CliGcLevel::Minimal => None,
+        CliGcLevel::Default => Some((keep, keep_oplog)),
+        // Keep every durably-committed generation, drop all op-log/ephemeral.
+        CliGcLevel::Aggressive => Some((u64::MAX, 0)),
+        // Keep only the current generation.
+        CliGcLevel::Reset => Some((0, 0)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_gc(
     project_dir: &Path,
+    level: CliGcLevel,
     keep: u64,
     keep_oplog: u64,
     max_size: Option<u64>,
+    min_age: Option<i64>,
     evict_logs: bool,
     dry_run: bool,
+    yes: bool,
     json: bool,
 ) -> Result<i32, AppError> {
+    if level == CliGcLevel::Reset && !yes {
+        return Err(AppError::Usage(
+            "gc --level reset drops every generation but the current one and clears pins; \
+             pass --yes to confirm"
+                .to_string(),
+        ));
+    }
     let stores = config::load_storeset(project_dir)?;
 
     // Phase 1: generation lifecycle — old generations go first so their
-    // roots are unregistered before the store sweep marks.
-    let generations =
-        views::remove_old_generations(project_dir, &stores, keep, keep_oplog, dry_run)?;
+    // roots are unregistered before the store sweep marks. Skipped by the
+    // two lightest levels (they never touch generations).
+    let generations = match generation_budgets(level, keep, keep_oplog) {
+        Some((keep, keep_oplog)) => {
+            views::remove_old_generations(project_dir, &stores, keep, keep_oplog, dry_run)?
+        }
+        None => ppg3_core::views::RemoveOldReport {
+            dry_run,
+            ..Default::default()
+        },
+    };
 
     // Phase 2: per-store mark/sweep of what is genuinely unreferenced now.
+    let policy = GcPolicy {
+        level: level.core(),
+        max_size,
+        min_age_ms: min_age,
+        evict_logs,
+        dry_run,
+    };
     let mut store_reports = std::collections::BTreeMap::new();
     let mut skipped_readonly_stores = Vec::new();
     for store in &stores.stores {
@@ -436,11 +613,7 @@ fn cmd_gc(
             skipped_readonly_stores.push(store.name().to_string());
             continue;
         }
-        let report = store.gc(&GcPolicy {
-            max_size,
-            evict_logs,
-            dry_run,
-        })?;
+        let report = store.gc(&policy)?;
         store_reports.insert(store.name().to_string(), report);
     }
 
@@ -453,24 +626,24 @@ fn cmd_gc(
         print_json(&combined)?;
     } else {
         let prefix = if dry_run { "[dry-run] " } else { "" };
-        println!(
-            "{prefix}phase 1 (old generations): dropped {} committed ({}), {} op-log ({}); kept {}",
-            combined.generations.dropped_committed.len(),
-            fmt_u64s(&combined.generations.dropped_committed),
-            combined.generations.dropped_oplog.len(),
-            fmt_u64s(&combined.generations.dropped_oplog),
-            fmt_u64s(&combined.generations.kept),
-        );
+        println!("{prefix}level {level:?}");
+        if generation_budgets(level, keep, keep_oplog).is_some() {
+            println!(
+                "{prefix}phase 1 (old generations): dropped {} committed ({}), {} op-log ({}); kept {}",
+                combined.generations.dropped_committed.len(),
+                fmt_u64s(&combined.generations.dropped_committed),
+                combined.generations.dropped_oplog.len(),
+                fmt_u64s(&combined.generations.dropped_oplog),
+                fmt_u64s(&combined.generations.kept),
+            );
+        } else {
+            println!("{prefix}phase 1 (old generations): skipped at this level");
+        }
         println!("{prefix}phase 2 (unreferenced store entries):");
         for (name, r) in &combined.stores {
-            println!(
-                "{prefix}  store {name}: removed {} entries, {} logs, {} dangling input link(s); freed {} bytes, {} bytes remaining",
-                r.removed_entries.len(),
-                r.removed_logs.len(),
-                r.removed_dangling_inputs.len(),
-                r.bytes_freed,
-                r.remaining_size,
-            );
+            // The report carries its own dry-run marker, so the structural
+            // prefix here is just the indentation + store label.
+            print_store_report_human(&format!("  store {name}: "), r);
         }
         for name in &combined.skipped_readonly_stores {
             println!("{prefix}  store {name}: skipped (readonly)");

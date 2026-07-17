@@ -1,4 +1,18 @@
 
+Resolved (branch claude/store-ppg3-gc-redesign-7vozjw):
+
+- store / .ppg3 split: kept, and now justified — see PRINCIPLES.md P3
+  ("one truth; everything else is a pointer or a cache") and PPG3_DESIGN.md
+  §11.2/§11.3. Store = shared truth; .ppg3 = this project's pointers + caches.
+  Generations/outputs living in .ppg3 (not the store) is correct by design.
+- GC redesign: levels failed-only / minimal / default / aggressive / reset
+  (`ppg3 gc --level`, `ppg3 store gc --level`), PPG3_DESIGN.md §11.2.
+  gc now cleans staging + stale leases/intents + violations at every level;
+  old/orphan build logs disappear (a swept entry's logs go with it; failed-
+  build logs are reclaimed once stale). `reset` = "as if only the current
+  generation ever ran here" (drops all other generations + pins).
+- `ppg3 store nuke --store PATH --yes` (§11.3) — the rm-rf-the-store door.
+
 Open:
 
 - pytest hangs? somewhere in test_watch.py
@@ -12,8 +26,11 @@ Open:
 - do we want a webserver? maybe for the watcher?
 
 - tmp should be local to store?
+  [CLARIFIED — build staging already lives in `<store>/v1/staging/` so
+   publish's rename() stays same-filesystem; the job's /tmp is a private
+   tmpfs by design (§6.1). GC now reclaims crashed staging dirs (§11.2).]
 
-- why do we need .ppg3 and a store?
+- why do we need .ppg3 and a store?  [RESOLVED — see P3 / §11.2 preamble above]
 
 - what's in todo?
 
@@ -35,6 +52,7 @@ Open:
 
 - can't rm -rf the store?
   I mean I get it... maybe we add a ppg3 nuke-store
+  [RESOLVED — `ppg3 store nuke --store PATH --yes`]
 
 - binary not in nd...
 
@@ -42,10 +60,14 @@ Open:
 
 - gc is not removing staging. generally, gc needs rework,
   we need gc 'aggressive', gc 'minimal', 'gc default', gc 'failed only'
+  [RESOLVED — `--level {failed-only,minimal,default,aggressive,reset}`, §11.2;
+   staging/leases/intents/violations cleaned at every level]
 
 
 - generations are not stored in the store, but in .pppg3
 - so are outputs. sheee...
+  [RESOLVED — correct by design: P3. Store = shared truth, .ppg3 = this
+   project's generations/outputs (pointers into the store).]
 
 - the 'no output on job fail' thing is idiotic. We should build as much as possible.
 
@@ -154,6 +176,8 @@ diff enries should offer to actually diff the damn files...
 
 -- 
 gc does nothing. even after removing all the generations
+  [RESOLVED — that was `default` keeping unrooted entries as cache. Use
+   `ppg3 gc --level aggressive` (reclaim every unrooted entry) or `reset`.]
 
 --
 wtf is meta.json, what's the use for the user?

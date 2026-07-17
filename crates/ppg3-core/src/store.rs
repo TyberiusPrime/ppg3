@@ -846,6 +846,27 @@ impl Store {
         self.ensure_writable()?;
         gc::run(self, policy)
     }
+
+    /// Delete the entire store directory (PPG3_DESIGN.md §11.3, "nuke").
+    /// Entries are `chmod a-w` on publish so a plain `rm -rf` fails half-way;
+    /// this restores write permission recursively first. The store is *truth*
+    /// (P3), so this is the one explicit, `--yes`-gated door to removing it —
+    /// there is no other deleter of published content besides GC.
+    pub fn nuke(&self) -> Result<(), Error> {
+        self.ensure_writable()?;
+        if !self.v1_dir().exists() {
+            return Ok(());
+        }
+        // Take the exclusive GC lock so a concurrent publish/GC can't be
+        // mid-operation while we tear the store down.
+        let _lock = GcLockGuard::lock_exclusive(&self.gc_lock_path())?;
+        let v1 = self.v1_dir();
+        chmod_recursive(&v1, true)?;
+        std::fs::remove_dir_all(&v1).map_err(|e| Error::io(&v1, e))?;
+        // Best-effort: drop the now-empty store root too, if it is empty.
+        let _ = std::fs::remove_dir(&self.root);
+        Ok(())
+    }
 }
 
 fn first_diff_offset(a: &Path, b: &Path) -> Result<Option<u64>, Error> {

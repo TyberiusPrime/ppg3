@@ -710,6 +710,91 @@ or deleting this file costs re-hashing only, never wrong reuse.
   GC can never sweep between rename and root creation (closes the
   SharedMFG race found in the ppg2 audit).
 
+### 11.2 GC levels (ratified amendment)
+
+The bare mark/sweep above answers "what is safe to delete under space
+pressure". It does not answer the operational questions that surfaced in
+practice — *"gc did nothing after I dropped every generation"*, *"nothing
+ever cleans `staging/`"*, *"old build logs pile up forever"*, *"how do I
+reclaim everything a crashed run left behind"*. The mechanism was right; it
+lacked a **policy dial**. This section ratifies one.
+
+**DECISION — GC is driven by a single ordered *level*, monotonically
+increasing in what it is willing to delete.** Each level does everything the
+level below it does, plus more. `ppg3 gc --level <L>` (project) and
+`ppg3 store gc --level <L>` (bare store) share the levels; the project
+command additionally runs the generation-lifecycle phase (§11.2a) before the
+per-store sweep.
+
+| level          | debris¹ | evict-marked + dangling | orphan logs² | unrooted normal entries              | generations dropped            | pins       |
+|----------------|:-------:|:-----------------------:|:------------:|--------------------------------------|--------------------------------|------------|
+| `failed-only`  | ✔       | –                       | ✔            | –                                    | none                           | kept       |
+| `minimal`      | ✔       | ✔                       | ✔            | –                                    | none                           | kept       |
+| `default`      | ✔       | ✔                       | ✔            | budget-driven (LRU, only with `--max-size`) | old, per budget³        | kept       |
+| `aggressive`   | ✔       | ✔                       | ✔            | **all unrooted**                     | all ephemeral / op-log         | kept       |
+| `reset`        | ✔       | ✔                       | ✔            | **all unrooted**                     | **all but current**            | **removed**|
+
+¹ *debris* = stale `staging/` build directories (owner dead or long-idle),
+stale `leases/` and `intents/` files (past their 30-min staleness window),
+and `staging/violations/` quarantine records. Never touches a live build:
+a `staging/` dir is swept only when its recorded pid is dead *on this host*,
+or (cross-host, where liveness is unknowable) when it has been idle past a
+generous window.
+
+² *orphan logs* = any `logs/<ik>/` whose `inputs/<ik>` no longer resolves to
+a live entry (a failed/abandoned build, or an entry a sweep just removed),
+**and** whose directory mtime is past the staleness window — the guard keeps
+GC from deleting the log directory of a build that is still running. When a
+sweep removes an entry it also removes that entry's `logs/<ik>/` directly
+(the entry was complete, so no guard is needed). The net invariant after any
+level: **`logs/` contains build logs for surviving entries and nothing
+else.** "Old build logs disappear" is not a special mode — it is what falls
+out of every level once an entry (or its build) is gone.
+
+³ Default keeps the *constructive-trace* promise (an unrooted entry is
+cache, not garbage — flipping a parameter back next week re-links it) by
+sweeping normal entries only under an explicit `--max-size` budget, LRU by
+the `.atime` file. `aggressive` abandons that promise deliberately: an
+unrooted entry is *whatever no retained generation, pin, or live lease
+points at*, and it goes. This is the answer to "gc did nothing after I
+dropped every generation" — that user wanted `aggressive`.
+
+`reset` is `aggressive` plus "as if the last run were the only thing that
+ever happened here": it drops *every* generation except the current one
+(§11.2a with a zero budget on both buckets), removes every pin, and then —
+because the only surviving roots are the current generation's link targets —
+the unrooted sweep leaves the store holding exactly the current output tree's
+entries and their logs. It is destructive of history and of explicit pins, so
+the CLI requires `--yes`.
+
+**Standalone `store gc` and generations.** A bare store has no project and
+therefore no generations; at store level `aggressive`/`reset` sweep against
+whatever roots projects have registered in that store's `roots/`, and
+`reset` additionally clears that store's pins. Dropping a project's
+generations is only meaningful through `ppg3 gc --project` (§11.2a).
+
+### 11.2a Two-phase project GC (unchanged mechanism, leveled)
+
+`ppg3 gc --level <L>` runs, in order:
+
+1. **Generation lifecycle** (`views::remove_old_generations`): the level
+   fixes the per-bucket keep budgets — `default` keeps `--keep` committed and
+   `--keep-oplog` op-log generations; `aggressive` keeps all durably
+   committed generations but zero op-log/ephemeral ones; `reset` keeps only
+   the current generation. Dropping a generation unregisters its roots in
+   every store it linked into. `failed-only`/`minimal` skip this phase.
+2. **Per-store mark/sweep** (`Store::gc` at the same level): now that the
+   surviving roots are settled, each writable store reclaims what those roots
+   no longer keep alive, per the table above.
+
+### 11.3 Nuking a store
+
+Entries are `chmod a-w` on publish, so `rm -rf <store>` fails
+half-way — deliberately, since the store is *truth* (P3). The explicit
+door is `ppg3 store nuke --store <path> --yes`: it restores write
+permission recursively and removes the store directory. Truth dies only by
+name, never by accident.
+
 ### 11.1 Concurrent coordinators on one store
 
 **DECISION — N coordinators (different projects, or the same project with

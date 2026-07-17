@@ -66,14 +66,22 @@ module doc comment and `core/src/gc.rs`'s module doc comment):
   `verify_entry` report a spurious mismatch on literally every published
   entry, and would make identical output content staged under different
   umasks spuriously fail to dedup (different oh for the same real file).
-- GC (`gc.rs`): `retain=Evict`-marked (`.ppg3-evict-ok`) unrooted entries
-  are swept on every `gc()` call regardless of `max_size` (§7.3 reads as
-  "first in line", not "only under space pressure"). Log eviction
-  (`GcPolicy.evict_logs`) is budget-driven only — logs are removed (oldest
-  first, always before any ordinary entry) only when `max_size` is set and
-  currently exceeded; a routine `gc()` call with no budget never touches
-  `logs/`, since §6.1a documents logs as valuable cross-machine cache-hit
-  debugging data, not disposable-by-default.
+- GC (`gc.rs`): now **leveled** (`GcPolicy.level: GcLevel`, PPG3_DESIGN.md
+  §11.2). `retain=Evict`-marked (`.ppg3-evict-ok`) unrooted entries are
+  swept from `minimal` up regardless of `max_size` (§7.3 reads as "first in
+  line", not "only under space pressure"). Budget log eviction
+  (`GcPolicy.evict_logs`) is still budget-driven at `default` — removed
+  (oldest first, before any ordinary entry) only when `max_size` is set and
+  exceeded, since §6.1a documents logs as valuable. On top of that, *every*
+  level now removes **orphan** logs (`logs/<ik>/` with no live `inputs/<ik>`
+  entry), mtime-guarded so a running build is never clobbered, and a swept
+  entry's `logs/<ik>/` is removed with it — the net invariant is "`logs/`
+  holds logs for surviving entries and nothing else". `aggressive` sweeps
+  every unrooted entry; `reset` additionally clears pins; both are combined
+  with the project-level generation-drop phase in `ppg3 gc --level`. Debris
+  (stale `staging/`, `leases/`, `intents/`, `violations/`) is cleaned at all
+  levels. `Store::nuke()` (§11.3) is the explicit rm-rf door (CLI: `store
+  nuke --yes`).
 - `Lease` gained `protect(oh)`/`unprotect(oh)` beyond bare
   create/heartbeat/drop. CONTRACT.md's GC rule needs a lease to be *about*
   a concrete oh set ("entries referenced by leases") but the one-line
@@ -1069,15 +1077,20 @@ b) **jj state captured per run.** `ppg3/jj.py` shells out to jj
    `meta.json` files still parse; omitted from JSON when absent).
    Capture happens *before* `_core.run` so the ids match the sources jobs
    were lowered from.
-c) **GC split in two.** New CLI `ppg3 gc [--keep N] [--keep-oplog M]
-   [--max-size B] [--evict-logs] [--dry-run]`: phase 1 = remove old
-   generations (`views::remove_old_generations`, unregisters roots; has
-   real dry-run support, unlike `keep_last`), phase 2 = per-store
-   mark/sweep (`Store::gc`) over every writable store in
-   `.ppg3/config.json` (readonly stores reported as skipped). Report keeps
-   the phases separate (`{"generations": .., "stores": .., 
-   "skipped_readonly_stores": ..}`). `store gc` / `generations keep`
-   remain unchanged for store-only / generations-only use.
+c) **GC split in two, now leveled (§11.2).** CLI `ppg3 gc [--level L]
+   [--keep N] [--keep-oplog M] [--max-size B] [--min-age DAYS] [--evict-logs]
+   [--dry-run] [--yes]`: phase 1 = remove old generations
+   (`views::remove_old_generations`, unregisters roots; has real dry-run
+   support, unlike `keep_last`), phase 2 = per-store mark/sweep (`Store::gc`
+   at the same level) over every writable store in `.ppg3/config.json`
+   (readonly stores reported as skipped). `--level` (`failed-only`, `minimal`,
+   `default`, `aggressive`, `reset`) fixes phase-1 budgets (`default` uses
+   `--keep`/`--keep-oplog`; `aggressive` keeps all committed + zero op-log;
+   `reset` keeps only current) and the phase-2 policy. `reset` requires
+   `--yes` (drops all non-current generations + all pins). Report keeps the
+   phases separate (`{"generations": .., "stores": .., 
+   "skipped_readonly_stores": ..}`). `store gc --level` / `store nuke --yes`
+   / `generations keep` cover store-only / whole-store / generations-only use.
 d) **Committed vs op-log generations.** Phase 1 buckets non-current
    generations: *op-log* = `vcs.committed == false` (dirty working copy —
    source state recoverable only via `jj op restore`) OR ephemeral

@@ -67,7 +67,7 @@ fn main() {
                 .gc(&GcPolicy {
                     max_size: Some(max_size),
                     evict_logs: true,
-                    dry_run: false,
+                    ..Default::default()
                 })
                 .expect("gc");
             println!(

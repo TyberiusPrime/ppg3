@@ -133,6 +133,22 @@ Sweep unrooted: `retain=Evict`-marked first (marker file
 touched on every lookup hit; delete until under `max_size` budget. Dangling
 `inputs/*` symlinks removed. `logs/` evicted before entries.
 
+GC is leveled (§11.2): `GcPolicy { level: GcLevel, max_size, min_age_ms,
+evict_logs, dry_run }`, `GcLevel ∈ {FailedOnly, Minimal, Default, Aggressive,
+Reset}` (declaration-ordered, `Default` is `Default::default()`). Every level
+first cleans **debris** (stale `staging/<host>-<pid>-<rand>/` — owner pid dead
+on this host, or idle past a generous window cross-host — plus stale
+`leases/`/`intents/` files and `staging/violations/` records) and **orphan
+logs** (`logs/<ik>/` with no live `inputs/<ik>` entry, mtime-guarded so a
+running build is never clobbered; a swept entry's logs go with it). `Minimal`+
+adds evict-marked entries and dangling `inputs/`. `Default` sweeps normal
+unrooted entries only under `max_size` (LRU, `min_age_ms` grace). `Aggressive`
+sweeps every unrooted entry; `Reset` also clears `pins/`. `GcReport` gains
+`removed_{staging,leases,intents,violations,pins}`.
+
+`Store::nuke()` (§11.3): exclusive-lock, `chmod +w -R`, remove the store dir.
+The one deleter of published content besides GC; CLI-gated behind `--yes`.
+
 ## StoreSet (storeset.rs, §4.1)
 
 ```rust
@@ -268,10 +284,15 @@ marker file. `list_generations` additionally exposes
 
 ## CLI (cli/, WP5)
 
-`ppg3 <cmd>` with clap: `store gc [--max-size BYTES] [--store PATH]
-[--dry-run] [--evict-logs]`, `store verify [--sample PCT|--entry OH]
---store PATH`, `generations list|rm N|keep N [--keep-explicit]`, `rollback
-[N]`, `explain <view-path>`, `diff-entries <oh1> <oh2> --store PATH`.
+`ppg3 <cmd>` with clap: `store gc [--level L] [--max-size BYTES] [--min-age
+DAYS] [--store PATH] [--dry-run] [--evict-logs] [--yes]`, `store nuke --store
+PATH --yes`, `store verify [--sample PCT|--entry OH] --store PATH`,
+`gc [--level L] [--keep N] [--keep-oplog N] [--max-size BYTES] [--min-age
+DAYS] [--evict-logs] [--dry-run] [--yes] [--project PATH]` (two-phase
+project GC, §11.2a), `generations list|rm N|keep N [--keep-explicit]`,
+`rollback [N]`, `explain <view-path>`, `diff-entries <oh1> <oh2> --store
+PATH`. `--level ∈ {failed-only, minimal, default, aggressive, reset}`
+(default `default`); `reset` requires `--yes`.
 Project commands find `.ppg3/` by walking up from cwd; `--project PATH`
 overrides (accepts either the project root or the `.ppg3` dir itself).
 Human-readable output + `--json`. Exit codes: `0` ok, `1` operational

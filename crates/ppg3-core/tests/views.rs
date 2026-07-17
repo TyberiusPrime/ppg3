@@ -681,6 +681,68 @@ fn remove_old_generations_dry_run_drops_nothing() {
     assert_eq!(remaining.len(), 2, "dry run must not drop anything");
 }
 
+/// The composition `ppg3 gc --level reset` orchestrates (§11.2a): drop every
+/// generation but the current one (unregistering their roots), clear pins,
+/// then a store-level Reset sweep. The store must end holding exactly the
+/// current generation's entry — "as if the last run were the only thing that
+/// ever ran here".
+#[test]
+fn project_reset_leaves_only_the_current_generations_entry() {
+    use ppg3_core::gc::{GcLevel, GcPolicy};
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Store::open("s", store_dir.path(), false).unwrap();
+    // Pin an extra, unrelated entry — reset must clear it.
+    let pinned_oh = publish_one(&store, "pinned", "p.txt", b"keepsake");
+    store.pin("release", &pinned_oh).unwrap();
+    let stores = StoreSet::new(vec![store]);
+    let project = tempfile::tempdir().unwrap();
+    let project_dir = project.path().join(".ppg3");
+
+    write_gen(&project_dir, &stores, "old1", false, Some(sample_vcs(true)));
+    write_gen(&project_dir, &stores, "old2", false, Some(sample_vcs(false)));
+    let cur = write_gen(&project_dir, &stores, "cur", false, Some(sample_vcs(true)));
+
+    // The current generation's single entry — the one thing that must survive.
+    let cur_oh = views::read_generation_meta(&project_dir, cur).unwrap().entries[0]
+        .oh
+        .clone();
+
+    // Phase 1: drop all but current (reset's generation budget = (0, 0)).
+    views::remove_old_generations(&project_dir, &stores, 0, 0, false).unwrap();
+    // Phase 2: store-level reset sweep.
+    let report = stores.stores[0]
+        .gc(&GcPolicy {
+            level: GcLevel::Reset,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(report.removed_pins.contains(&"release".to_string()));
+    assert!(!store_dir
+        .path()
+        .join("v1")
+        .join("pins")
+        .join("release")
+        .exists());
+
+    let surviving: Vec<String> = std::fs::read_dir(store_dir.path().join("v1").join("entries"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        surviving,
+        vec![cur_oh],
+        "only the current generation's entry survives reset"
+    );
+
+    // The current generation is still current and its output tree resolves.
+    assert_eq!(
+        views::current_generation_number(&project_dir).unwrap(),
+        Some(cur)
+    );
+}
+
 #[test]
 fn generation_meta_json_has_expected_shape() {
     let store_dir = tempfile::tempdir().unwrap();

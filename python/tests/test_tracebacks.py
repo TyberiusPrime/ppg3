@@ -151,3 +151,59 @@ def test_shim_frames_get_a_clean_breadcrumb_line():
     assert "should-not-render" not in out
     # ...but the real user frame still renders its source.
     assert "raise ValueError('boom')" in out
+
+
+def test_single_failure_inlines_full_log_and_drops_truncated_tail(tmp_path):
+    """With exactly one failed job, format_failures inlines the whole
+    consolidated log (so the user needn't open the file), and it suppresses
+    the truncated stderr-tail block that would otherwise duplicate it."""
+    from ppg3.run import RunResult
+
+    log = tmp_path / "failure.log"
+    log.write_text(
+        "=== traceback / stderr ===\n"
+        "Traceback (most recent call last):\n"
+        "  /proj/analysis.py:2, in _boom\n"
+        "KeyError: 'deliberately_missing'\n"
+        "=== stdout ===\n"
+        "progress: 100%\n"
+    )
+    report = {
+        "failed": {"j0": "KeyError: 'deliberately_missing'\n--- stderr tail ---\nline\ntail-two\n"},
+        "failed_details": {
+            "j0": {"reason": "KeyError\n--- stderr tail ---\nline\ntail-two",
+                   "failure_log": str(log)},
+        },
+    }
+    result = RunResult(report, job_meta={"j0": {"label": "out.txt"}})
+    text = result.format_failures()
+
+    assert "1 job(s) failed" in text
+    assert "--- full log ---" in text
+    assert "progress: 100%" in text, "full log body (stdout section) missing"
+    assert "=== traceback / stderr ===" in text
+    # The 15-line truncated tail block is suppressed in favour of the full log.
+    assert "Stderr:" not in text
+
+
+def test_multiple_failures_keep_tail_and_no_full_log(tmp_path):
+    """Two+ failures keep the per-job truncated tail and do NOT dump any
+    single job's full log (that only makes sense for a lone failure)."""
+    from ppg3.run import RunResult
+
+    report = {
+        "failed": {
+            "a": "Boom\n--- stderr tail ---\nfirst\nsecond",
+            "b": "Bang\n--- stderr tail ---\nthird\nfourth",
+        },
+        "failed_details": {
+            "a": {"reason": "Boom\n--- stderr tail ---\nfirst\nsecond"},
+            "b": {"reason": "Bang\n--- stderr tail ---\nthird\nfourth"},
+        },
+    }
+    result = RunResult(report, job_meta={"a": {"label": "a.txt"}, "b": {"label": "b.txt"}})
+    text = result.format_failures()
+
+    assert "2 job(s) failed" in text
+    assert "--- full log ---" not in text
+    assert "Stderr:" in text

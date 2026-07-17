@@ -150,8 +150,16 @@ class RunResult:
         names = sorted(self.failed)
         if not names:
             return "no failed jobs"
-        blocks = [self._format_one_failure(name) for name in names]
+        # When exactly one job failed, the log *is* the story: inline its
+        # full consolidated log so the user reads the whole traceback right
+        # here instead of opening the file the `Log:` field points at. In
+        # that case the per-job block drops its truncated stderr tail, since
+        # the full log (which includes stderr) follows in its entirety.
+        full = self._read_failure_log(names[0]) if len(names) == 1 else ""
+        blocks = [self._format_one_failure(name, inline_tail=not full) for name in names]
         text = f"{len(names)} job(s) failed:\n\n" + "\n\n".join(blocks)
+        if full:
+            text += "\n\n--- full log ---\n" + full
         if self.partial_dir:
             text += (
                 f"\n\nPartial results: {self.partial_dir}\n"
@@ -160,7 +168,7 @@ class RunResult:
             )
         return text
 
-    def _format_one_failure(self, name: str) -> str:
+    def _format_one_failure(self, name: str, inline_tail: bool = True) -> str:
         detail = self.failed_details.get(name, {})
         lines: List[str] = []
 
@@ -194,7 +202,7 @@ class RunResult:
         # stderr tail (which for e.g. a fetch mismatch carries the url,
         # both hashes, and the retained-download path) instead of reducing
         # it to one line.
-        if "--- stderr tail ---" in reason:
+        if inline_tail and "--- stderr tail ---" in reason:
             tail = reason.split("--- stderr tail ---", 1)[1].strip().splitlines()
             if len(tail) > 1:  # a single line is already the Exception above
                 lines.append("Stderr:")
@@ -215,6 +223,22 @@ class RunResult:
                 field("Kept", kept)
 
         return "\n".join(lines)
+
+    def _read_failure_log(self, name: str) -> str:
+        """Full text of a failed job's consolidated log, or ``""`` if there
+        is no readable log. Best-effort: a missing/unreadable log must never
+        turn a job failure into a *reporting* failure."""
+        import os
+
+        detail = self.failed_details.get(name, {})
+        log = detail.get("failure_log")
+        if not log or not os.path.isfile(log):
+            return ""
+        try:
+            with open(log, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read().rstrip("\n")
+        except OSError:
+            return ""
 
     @staticmethod
     def _kept_files(out_dir: str, limit: int = 5) -> List[str]:

@@ -230,6 +230,9 @@ needs a flush?
 
 
 -- when there's only one job failing, show it's error log straight away
+  [RESOLVED — with exactly one failed job, `format_failures` inlines the
+   whole consolidated log under `--- full log ---` (and drops the truncated
+   stderr-tail block that would otherwise duplicate it).]
 
 -- fetch isn't sound.
 Removing the hash doesn't trigger a refetch.

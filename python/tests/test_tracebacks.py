@@ -26,6 +26,14 @@ def _boom(io):
         fh.write(data["deliberately_missing"])  # KeyError
 
 
+def _print_then_boom(io):
+    # A print immediately before the raise: on a non-tty stdout is
+    # block-buffered, so this only survives into the log if the shim flushes
+    # stdout on the failure path.
+    print("PROGRESS-MARKER-42")
+    raise RuntimeError("kaboom after printing")
+
+
 def _make_failing_graph(tmp_path, forkserver):
     store_dir = tmp_path / "store"
     store_dir.mkdir()
@@ -75,6 +83,31 @@ def test_failed_job_rich_traceback_and_table(tmp_path, forkserver):
     # stdout/stderr sections are both present in the consolidated log.
     assert "=== traceback / stderr ===" in log_text
     assert "=== stdout ===" in log_text
+
+
+@requires_core
+@pytest.mark.parametrize("forkserver", [True, False])
+def test_print_before_exception_survives_into_log(tmp_path, forkserver):
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    g = ppg3.new(
+        stores=[ppg3.Store("main", str(store_dir))],
+        default_python=PyEnv.current(),
+        project_dir=str(tmp_path / ".ppg3"),
+        frozen=False,
+        paranoid=True,
+        forkserver=forkserver,
+    )
+    ppg3.FileJob(outputs={"out": "out.txt"}, run=_print_then_boom)
+    with pytest.raises(PPGRunError) as exc_info:
+        ppg3.run(g, project_id="tb-flush")
+
+    from pathlib import Path
+
+    detail = exc_info.value.result.failed_details["out.txt"]
+    log_text = Path(detail["failure_log"]).read_text()
+    assert "PROGRESS-MARKER-42" in log_text, "buffered stdout lost before exception"
+    assert "kaboom after printing" in log_text
 
 
 @requires_core

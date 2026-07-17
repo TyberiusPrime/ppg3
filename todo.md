@@ -243,6 +243,10 @@ Same for input...  what happens if an input has more than one file?
 --
 Print's are getting lost before exceptions?
 needs a flush?
+  [RESOLVED — yes: forkserver children exit via os._exit(), which skips
+   Python's buffer flush, so block-buffered stdout before a raise was lost.
+   `_shim.main` now flushes stdout on the failure path and stdout+stderr in
+   a finally, before returning to the os._exit() caller.]
 
 
 -- when there's only one job failing, show it's error log straight away

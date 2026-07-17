@@ -356,8 +356,19 @@ def main(argv=None) -> int:
             sys.stderr.write(f"ppg3._shim: unknown mode {mode!r}\n")
             return 1
     except Exception:
+        # Flush the job's own stdout first: on a non-tty (a pipe/file, as
+        # under the scheduler) stdout is block-buffered, so a `print()` right
+        # before the raise would otherwise be swallowed or land *after* the
+        # traceback in the consolidated log. The user's last words before the
+        # crash are usually the most useful ones.
+        sys.stdout.flush()
         _print_failure(sys.stderr)
         return 1
+    finally:
+        # Never leave buffered output for the interpreter to (maybe) flush at
+        # exit — the scheduler reads these streams itself.
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 
 if __name__ == "__main__":

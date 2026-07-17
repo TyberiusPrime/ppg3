@@ -686,6 +686,31 @@ fn fmt_u64s(ns: &[u64]) -> String {
     ns.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
 }
 
+/// Render a Unix epoch-milliseconds timestamp as a human `YYYY-MM-DD
+/// HH:MM:SSZ` (UTC) string for CLI display. Kept dependency-free (no
+/// chrono/time) via Howard Hinnant's civil-from-days algorithm — the JSON
+/// output still carries the raw `created_at` ms for machines.
+fn fmt_epoch_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    // days is days since 1970-01-01; shift epoch to 0000-03-01 (Hinnant).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+
+    format!("{year:04}-{month:02}-{day:02} {hh:02}:{mm:02}:{ss:02}Z")
+}
+
 // ---- generations ----
 
 fn cmd_generations_list(project_dir: &Path, json: bool) -> Result<i32, AppError> {
@@ -694,8 +719,8 @@ fn cmd_generations_list(project_dir: &Path, json: bool) -> Result<i32, AppError>
         print_json(&gens)?;
     } else {
         println!(
-            "{:<6} {:<16} {:<10} {:<8} {:<10} {:<14} ENTRIES",
-            "GEN", "CREATED_AT_MS", "EPHEMERAL", "CURRENT", "VCS", "CHANGE_ID"
+            "{:<6} {:<20} {:<10} {:<8} {:<10} {:<14} ENTRIES",
+            "GEN", "CREATED (UTC)", "EPHEMERAL", "CURRENT", "VCS", "CHANGE_ID"
         );
         for g in &gens {
             let (vcs_state, change_id) = match &g.vcs {
@@ -705,8 +730,14 @@ fn cmd_generations_list(project_dir: &Path, json: bool) -> Result<i32, AppError>
             };
             let change_short: String = change_id.chars().take(12).collect();
             println!(
-                "{:<6} {:<16} {:<10} {:<8} {:<10} {:<14} {}",
-                g.n, g.created_at, g.ephemeral, g.current, vcs_state, change_short, g.n_entries
+                "{:<6} {:<20} {:<10} {:<8} {:<10} {:<14} {}",
+                g.n,
+                fmt_epoch_ms(g.created_at),
+                g.ephemeral,
+                g.current,
+                vcs_state,
+                change_short,
+                g.n_entries
             );
         }
     }
@@ -957,4 +988,24 @@ fn cmd_blake3sum(paths: &[PathBuf], json: bool) -> Result<i32, AppError> {
         print_json(&lines)?;
     }
     Ok(if any_err { 1 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_epoch_ms;
+
+    // Expected values cross-checked against Python's
+    // `datetime.fromtimestamp(s, timezone.utc)`.
+    #[test]
+    fn fmt_epoch_ms_known_values() {
+        assert_eq!(fmt_epoch_ms(0), "1970-01-01 00:00:00Z");
+        assert_eq!(fmt_epoch_ms(1_784_637_296_000), "2026-07-21 12:34:56Z");
+        assert_eq!(fmt_epoch_ms(1_610_000_000_000), "2021-01-07 06:13:20Z");
+        // A leap day, to exercise the civil-from-days branch.
+        assert_eq!(fmt_epoch_ms(1_582_934_400_000), "2020-02-29 00:00:00Z");
+        // Sub-second remainder floors toward the whole second, even before
+        // the epoch (div_euclid, not truncation).
+        assert_eq!(fmt_epoch_ms(1_784_637_296_999), "2026-07-21 12:34:56Z");
+        assert_eq!(fmt_epoch_ms(-1), "1969-12-31 23:59:59Z");
+    }
 }

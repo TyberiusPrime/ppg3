@@ -165,6 +165,9 @@ a non-symlinked copy?
 -- 
 ux generations:
 'created_at_ms' - user facing timestamps? seriously?
+  [RESOLVED — `generations list` human output now shows a `CREATED (UTC)`
+   column formatted `YYYY-MM-DD HH:MM:SSZ` (dependency-free); `--json` keeps
+   the raw `created_at` ms for machines.]
 
 -- 
 what does 

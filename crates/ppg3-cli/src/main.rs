@@ -178,8 +178,9 @@ enum Command {
     DiffEntries {
         oh1: String,
         oh2: String,
+        /// Store path; defaults to the project's sole configured store.
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
     },
     /// blake3-hash files, in the same lowercase-hex form ppg3 uses for
     /// output hashes (`oh`). Handy for checking by hand whether a file
@@ -205,8 +206,9 @@ enum StoreCmd {
         /// `default`-level grace, in days (see `ppg3 gc --min-age`).
         #[arg(long, value_parser = parse_min_age_days)]
         min_age: Option<i64>,
+        /// Store path; defaults to the project's sole configured store.
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
         /// Allow GC to evict `logs/` under budget pressure.
@@ -220,8 +222,9 @@ enum StoreCmd {
     /// fails half-way; this restores write permission and removes it. The
     /// store is truth (P3), so this is deliberately explicit and --yes-gated.
     Nuke {
+        /// Store path; defaults to the project's sole configured store.
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
         /// Required confirmation.
         #[arg(long)]
         yes: bool,
@@ -237,8 +240,9 @@ enum StoreCmd {
         /// Verify exactly one entry by output hash.
         #[arg(long, conflicts_with = "sample")]
         entry: Option<String>,
+        /// Store path; defaults to the project's sole configured store.
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
     },
 }
 
@@ -304,15 +308,24 @@ fn run(cli: Cli) -> Result<i32, AppError> {
                 dry_run,
                 evict_logs,
                 yes,
-            } => cmd_store_gc(
-                &store, level, max_size, min_age, dry_run, evict_logs, yes, json,
-            ),
-            StoreCmd::Nuke { store, yes } => cmd_store_nuke(&store, yes, json),
+            } => {
+                let store = config::resolve_single_store(store.as_deref())?;
+                cmd_store_gc(
+                    &store, level, max_size, min_age, dry_run, evict_logs, yes, json,
+                )
+            }
+            StoreCmd::Nuke { store, yes } => {
+                let store = config::resolve_single_store(store.as_deref())?;
+                cmd_store_nuke(&store, yes, json)
+            }
             StoreCmd::Verify {
                 sample,
                 entry,
                 store,
-            } => cmd_store_verify(&store, sample, entry, json),
+            } => {
+                let store = config::resolve_single_store(store.as_deref())?;
+                cmd_store_verify(&store, sample, entry, json)
+            }
         },
         Command::Generations { cmd } => match cmd {
             GenerationsCmd::List { project } => {
@@ -371,7 +384,10 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             let project_dir = config::resolve_project_dir(project.as_deref())?;
             cmd_explain(&project_dir, &view_path, json)
         }
-        Command::DiffEntries { oh1, oh2, store } => cmd_diff_entries(&store, &oh1, &oh2, json),
+        Command::DiffEntries { oh1, oh2, store } => {
+            let store = config::resolve_single_store(store.as_deref())?;
+            cmd_diff_entries(&store, &oh1, &oh2, json)
+        }
         Command::Blake3sum { paths } => cmd_blake3sum(&paths, json),
     }
 }

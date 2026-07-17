@@ -74,6 +74,43 @@ pub fn resolve_project_dir(explicit: Option<&Path>) -> Result<PathBuf, AppError>
     })
 }
 
+/// Resolve a single store path for the store-level commands (`store gc`,
+/// `store nuke`, `store verify`, `diff-entries`). An explicit `--store`
+/// always wins; otherwise we walk up from the current directory for a
+/// project and, if its `config.json` lists exactly one store, use that.
+/// Zero or many configured stores is an error telling the user to pass
+/// `--store` — we never guess which of several stores they meant.
+pub fn resolve_single_store(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    let cwd = std::env::current_dir().map_err(|e| AppError::Io(e.to_string()))?;
+    let project_dir = find_project_dir(&cwd).ok_or_else(|| {
+        AppError::Usage(format!(
+            "no --store given and no .ppg3/ found walking up from {cwd:?}; pass --store PATH"
+        ))
+    })?;
+    let config_path = project_dir.join("config.json");
+    let bytes = std::fs::read(&config_path)
+        .map_err(|e| AppError::Operational(format!("reading {config_path:?}: {e}")))?;
+    let config: ProjectConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::Operational(format!("parsing {config_path:?}: {e}")))?;
+    match config.stores.as_slice() {
+        [only] => Ok(only.path.clone()),
+        [] => Err(AppError::Usage(format!(
+            "{config_path:?} configures no stores; pass --store PATH"
+        ))),
+        many => {
+            let names: Vec<&str> = many.iter().map(|s| s.name.as_str()).collect();
+            Err(AppError::Usage(format!(
+                "{} stores configured ({}); pass --store PATH to pick one",
+                many.len(),
+                names.join(", ")
+            )))
+        }
+    }
+}
+
 /// Load `<project_dir>/config.json` and open every configured store.
 pub fn load_storeset(project_dir: &Path) -> Result<StoreSet, AppError> {
     let config_path = project_dir.join("config.json");

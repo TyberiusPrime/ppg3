@@ -186,6 +186,9 @@ And isn't it's entries essentially just a recapulation of the symlinks???
 --
 ppg3 binary
 auto find the store if there is only one.
+  [RESOLVED — `--store` is now optional on `store gc/nuke/verify` and
+   `diff-entries`; when omitted, ppg3 walks up for the project and uses its
+   sole configured store, erroring (asking for --store) on zero or many.]
 
 
 -- 

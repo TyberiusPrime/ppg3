@@ -221,6 +221,11 @@ And generally a rework, the whole thing seems whack,
 or at least I had to look at the damn source.
 path should be out_path - and return a Path(!).
 Same for input...  what happens if an input has more than one file?
+  [PARTIALLY RESOLVED — `JobIO` now has a `__repr__` listing declared
+   inputs/outputs/tools/params; `io.input()` and `io.path()`/`io.out_path()`
+   return `pathlib.Path`; `tool()` stays `str` (spliced into commands). The
+   multi-file-input data model (an input name -> several files) is still the
+   flagged bigger rework.]
 
 
 

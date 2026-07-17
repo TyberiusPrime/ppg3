@@ -45,10 +45,22 @@ class JobIO:
             k: canon.decanonicalize_value(v) for k, v in raw_params.items()
         }
 
+    def __repr__(self) -> str:
+        return (
+            "JobIO("
+            f"inputs={sorted(self._inputs)}, "
+            f"outputs={sorted(self._outputs)}, "
+            f"tools={sorted(self._tools)}, "
+            f"params={sorted(self.params)})"
+        )
+
     # -- inputs -----------------------------------------------------------
-    def input(self, name: str) -> str:
+    def input(self, name: str) -> Path:
+        """Real path of a declared input, as a :class:`pathlib.Path`. A
+        single input name maps to a single path (a job that depends on
+        another job's whole output gets that output's directory)."""
         try:
-            return self._inputs[name]
+            return Path(self._inputs[name])
         except KeyError:
             raise JobIOError(
                 f"no declared input named {name!r}; declared inputs: "
@@ -58,8 +70,7 @@ class JobIO:
     def load(self, name: str) -> Any:
         """Unpickle a `DataJob`-produced artifact (or any pickled input),
         memoized per process by resolved path."""
-        raw_path = self.input(name)
-        p = Path(raw_path)
+        p = self.input(name)
         if p.is_dir():
             p = p / "data.pickle"
         key = str(p.resolve()) if p.exists() else str(p)
@@ -71,9 +82,10 @@ class JobIO:
         return obj
 
     # -- outputs ------------------------------------------------------------
-    def path(self, name: Optional[str] = None) -> str:
-        """Path to a declared output. If the job has exactly one declared
-        output, ``name`` may be omitted."""
+    def path(self, name: Optional[str] = None) -> Path:
+        """Path to write a declared output to, as a :class:`pathlib.Path`.
+        If the job has exactly one declared output, ``name`` may be
+        omitted."""
         if name is None:
             if len(self._outputs) != 1:
                 raise JobIOError(
@@ -82,7 +94,7 @@ class JobIO:
                 )
             name = next(iter(self._outputs))
         try:
-            return self._outputs[name]
+            return Path(self._outputs[name])
         except KeyError:
             raise JobIOError(
                 f"no declared output named {name!r}; declared outputs: "
@@ -90,10 +102,13 @@ class JobIO:
             ) from None
 
     # `out.path(...)` in the CONTRACT.md text is the same object as `io`;
-    # kept as an alias for readability at call sites.
-    out_path = path
+    # `out_path` is kept as an alias for readability at call sites.
+    def out_path(self, name: Optional[str] = None) -> Path:
+        return self.path(name)
 
     # -- tools --------------------------------------------------------------
+    # NB: `tool()` stays a `str` — tools are usually spliced into command
+    # strings/argv, where a bare path is what callers want.
     def tool(self, name: str) -> str:
         try:
             return self._tools[name]

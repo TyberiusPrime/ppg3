@@ -24,22 +24,32 @@ def dummy_run(io):
 
 
 @requires_blake3
-def test_filejob_stable_id_from_view(graph):
-    job = ppg3.FileJob(view={"counts": "results/counts.tsv"}, run=dummy_run)
-    assert job.id == "results/counts.tsv"
+def test_filejob_identity_is_content_not_names(graph):
+    # PRINCIPLES.md P1: the id derives from the definition fingerprint;
+    # the user-facing handle is the published destination (label).
+    job = ppg3.FileJob(outputs={"counts": "results/counts.tsv"}, run=dummy_run)
+    assert job.label == "results/counts.tsv"
+    assert job.id.startswith("j")
 
 
 @requires_blake3
-def test_filejob_explicit_name_overrides(graph):
-    job = ppg3.FileJob(view={"counts": "results/counts.tsv"}, run=dummy_run, name="my-job")
-    assert job.id == "my-job"
+def test_identical_redefinition_merges(graph):
+    # P2.3: the same definition twice is one job, stated twice.
+    a = ppg3.FileJob(outputs={"counts": "results/counts.tsv"}, run=dummy_run)
+    b = ppg3.FileJob(outputs={"counts": "results/counts.tsv"}, run=dummy_run)
+    assert a.id == b.id
+    assert len(graph.jobs) == 1
 
 
 @requires_blake3
-def test_duplicate_job_id_rejected(graph):
-    ppg3.FileJob(view={"a": "out.txt"}, run=dummy_run, name="dupe")
-    with pytest.raises(DefinitionError):
-        ppg3.FileJob(view={"a": "out2.txt"}, run=dummy_run, name="dupe")
+def test_contested_destination_rejected(graph):
+    # P2.1: the only definition-time conflict — two *different* jobs, one
+    # destination. (Same-recipe jobs with different destinations are legal,
+    # P1.2 — so make the second job actually differ.)
+    ppg3.FileJob(outputs={"a": "out.txt"}, run=dummy_run)
+    with pytest.raises(DefinitionError) as ei:
+        ppg3.FileJob(outputs={"a": "out.txt"}, run=dummy_run, env={"X": "1"})
+    assert "defined at" in str(ei.value)
 
 
 def test_serialize_argv_placeholders():
@@ -65,11 +75,11 @@ def test_serialize_argv_rejects_bad_type():
 @requires_blake3
 def test_commandjob_job_def_shape(graph):
     job = ppg3.CommandJob(
-        view={"sorted.bam": "out/sorted.bam"},
+        outputs={"sorted.bam": "out/sorted.bam"},
         argv=[Tool("samtools"), "sort", In("bam"), "-o", Out()],
     )
     jd = job.job_def(graph)
-    assert jd["id"] == "out/sorted.bam"
+    assert jd["id"] == job.id
     assert jd["exec_template"] == {
         "Argv": {
             "argv": ["{tool:samtools}", "sort", "{in:bam}", "-o", "{out}"],
@@ -84,9 +94,9 @@ def test_commandjob_job_def_shape(graph):
 
 @requires_blake3
 def test_retain_json_variants(graph):
-    j1 = ppg3.CommandJob(view={"a": "a.txt"}, argv=["true"], retain=ppg3.Retain.Evict)
+    j1 = ppg3.CommandJob(outputs={"a": "a.txt"}, argv=["true"], retain=ppg3.Retain.Evict)
     j2 = ppg3.CommandJob(
-        view={"b": "b.txt"}, argv=["true"], retain=ppg3.Retain.Pin("keep-me")
+        outputs={"b": "b.txt"}, argv=["true"], retain=ppg3.Retain.Pin("keep-me")
     )
     assert j1.job_def(graph)["retain"] == "Evict"
     assert j2.job_def(graph)["retain"] == {"Pin": "keep-me"}
@@ -100,7 +110,7 @@ def test_fetchjob_frozen_mode_requires_blake3(tmp_path):
         frozen=True,
     )
     with pytest.raises(DefinitionError):
-        ppg3.FetchJob(view="inputs/genome.fa.gz", url="https://example.invalid/genome.fa.gz")
+        ppg3.FetchJob(outputs="inputs/genome.fa.gz", url="https://example.invalid/genome.fa.gz")
 
 
 @requires_blake3
@@ -110,7 +120,7 @@ def test_fetchjob_non_frozen_allows_none_hash(tmp_path):
         project_dir=str(tmp_path / ".ppg3"),
         frozen=False,
     )
-    job = ppg3.FetchJob(view="inputs/genome.fa.gz", url="https://example.invalid/genome.fa.gz")
+    job = ppg3.FetchJob(outputs="inputs/genome.fa.gz", url="https://example.invalid/genome.fa.gz")
     assert job.job_def()["fixed_output"] is None
 
 
@@ -122,7 +132,7 @@ def test_fetchjob_with_hash_ok_even_frozen(tmp_path):
         frozen=True,
     )
     job = ppg3.FetchJob(
-        view="inputs/genome.fa.gz",
+        outputs="inputs/genome.fa.gz",
         url="https://example.invalid/genome.fa.gz",
         blake3="a" * 64,
     )
@@ -142,7 +152,7 @@ def test_fetchjob_key_is_independent_of_pyenv(tmp_path):
         project_dir=str(tmp_path / ".ppg3"),
         frozen=False,
     )
-    jd = ppg3.FetchJob(view="inputs/x.dat", url="https://example.invalid/x").job_def()
+    jd = ppg3.FetchJob(outputs="inputs/x.dat", url="https://example.invalid/x").job_def()
     assert jd["runtime"]["python_env"] is None, jd["runtime"]
     # It still runs through the shim (argv[0] is a real interpreter path).
     assert jd["exec_template"]["Argv"]["argv"][0]
@@ -165,7 +175,7 @@ def test_pyenv_current_hash_is_stable_across_cwd_mutation(tmp_path, monkeypatch)
 @requires_blake3
 def test_unsandboxedjob_warns(graph):
     with pytest.warns(UserWarning, match="unsandboxed"):
-        job = ppg3.UnsandboxedJob(run=dummy_run, name="loader-thing")
+        job = ppg3.UnsandboxedJob(run=dummy_run)
     assert job.job_def()["exec_template"] == "InProcess"
 
 
@@ -174,7 +184,7 @@ def test_datajob_output_name_fixed(graph):
     def train(io):
         return 42
 
-    job = ppg3.DataJob(view="models/foo", run=train)
+    job = ppg3.DataJob(outputs="models/foo", run=train)
     jd = job.job_def(graph)
     assert jd["outputs_declared"] == ["data.pickle"]
     assert jd["view"] == {"data.pickle": "models/foo"}
@@ -189,7 +199,7 @@ def test_graphjob_job_def_shape(graph):
     job = ppg3.GraphJob(expand)
     jd = job.job_def()
     assert jd["exec_template"] == "InProcess"
-    assert jd["id"] == expand.__qualname__
+    assert jd["id"] == job.id
 
 
 @requires_blake3
@@ -197,7 +207,7 @@ def test_input_lowering_file_and_params(graph, tmp_path):
     data_file = tmp_path / "raw.txt"
     data_file.write_text("hello")
     job = ppg3.FileJob(
-        view={"out": "out.txt"},
+        outputs={"out": "out.txt"},
         run=dummy_run,
         inputs={
             "raw": ppg3.File(str(data_file)),
@@ -219,9 +229,9 @@ def test_input_lowering_file_and_params(graph, tmp_path):
 
 @requires_blake3
 def test_input_lowering_job_subset(graph):
-    upstream = ppg3.FileJob(view={"fasta": "ref/fasta.fa", "log": "ref/log"}, run=dummy_run)
+    upstream = ppg3.FileJob(outputs={"fasta": "ref/fasta.fa", "log": "ref/log"}, run=dummy_run)
     downstream = ppg3.FileJob(
-        view={"out": "out.txt"}, run=dummy_run, inputs={"ref": upstream["fasta"]}
+        outputs={"out": "out.txt"}, run=dummy_run, inputs={"ref": upstream["fasta"]}
     )
     jd = downstream.job_def(graph)
     assert jd["inputs"]["ref"] == {"JobSubset": {"id": upstream.id, "names": ["fasta"]}}
@@ -229,9 +239,9 @@ def test_input_lowering_job_subset(graph):
 
 @requires_blake3
 def test_input_lowering_whole_job(graph):
-    upstream = ppg3.FileJob(view={"fasta": "ref/fasta.fa"}, run=dummy_run)
+    upstream = ppg3.FileJob(outputs={"fasta": "ref/fasta.fa"}, run=dummy_run)
     downstream = ppg3.FileJob(
-        view={"out": "out.txt"}, run=dummy_run, inputs={"reads": upstream}
+        outputs={"out": "out.txt"}, run=dummy_run, inputs={"reads": upstream}
     )
     jd = downstream.job_def(graph)
     assert jd["inputs"]["reads"] == {"Job": {"id": upstream.id}}
@@ -242,4 +252,4 @@ def test_no_active_graph_raises():
 
     jobs_mod._current_graph = None
     with pytest.raises(DefinitionError):
-        ppg3.CommandJob(view={"a": "a.txt"}, argv=["true"])
+        ppg3.CommandJob(outputs={"a": "a.txt"}, argv=["true"])

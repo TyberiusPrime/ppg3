@@ -37,7 +37,7 @@ def _make_failing_graph(tmp_path, forkserver):
         paranoid=True,
         forkserver=forkserver,
     )
-    ppg3.FileJob(view={"out": "out.txt"}, run=_boom)
+    ppg3.FileJob(outputs={"out": "out.txt"}, run=_boom)
     return g
 
 
@@ -88,8 +88,8 @@ def test_format_failures_lists_all(tmp_path):
         frozen=False,
         paranoid=True,
     )
-    ppg3.FileJob(view={"a": "a.txt"}, run=_boom)
-    ppg3.FileJob(view={"b": "b.txt"}, run=_boom)
+    ppg3.FileJob(outputs={"a": "a.txt"}, run=_boom)
+    ppg3.FileJob(outputs={"b": "b.txt"}, run=_boom)
     with pytest.raises(PPGRunError) as exc_info:
         ppg3.run(g, project_id="tb-multi")
 

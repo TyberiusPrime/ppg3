@@ -63,7 +63,7 @@ def make_summary(io):
         fh.write(text.strip().upper() + str(n))
 
 ppg3.FileJob(
-    view={"summary": "summary.txt"},
+    outputs={"summary": "summary.txt"},
     run=make_summary,
     inputs={
         "greeting": greeting,

@@ -99,10 +99,31 @@ def test_deleting_the_project_dir_loses_pointers_not_content(tmp_path):
 @requires_core
 @principle("P3.4")
 def test_generation_pointer_state_has_one_authoritative_form(tmp_path):
-    # Intent: a generation is either a record from which the link tree is
-    # derived, or the link tree itself — corruption of the derived form is
-    # detected/regenerated, never silently believed. Needs a
-    # `ppg3 generations verify`-style entry point to assert against;
-    # today meta.json and the symlink tree are written independently and
-    # nothing cross-checks them.
-    pytest.fail("needs a generation-verification entry point to assert against")
+    # A generation's record (meta.json) is the authoritative form; the
+    # symlink tree is derived. Disagreement — in either direction — is
+    # detected, never silently believed.
+    import os
+
+    g = new_graph(tmp_path)
+    command_job({"out": "a.txt"}, argv=["/bin/sh", "-c", "echo a > {out:out}"])
+    r = run_graph(g)
+    assert r.failed == {}
+
+    project_dir = str(tmp_path / ".ppg3")
+    assert ppg3.verify_generation(project_dir) == []
+
+    gen_dir = os.path.realpath(os.path.join(project_dir, "views", "current"))
+
+    # Derived form drifts: repoint the link somewhere the record doesn't say.
+    link = os.path.join(gen_dir, "a.txt")
+    os.remove(link)
+    os.symlink("/dev/null", link)
+    assert any("a.txt" in p for p in ppg3.verify_generation(project_dir))
+
+    # Stray file the record never claimed.
+    os.remove(link)
+    problems = ppg3.verify_generation(project_dir)
+    assert any("a.txt" in p for p in problems)
+    with open(os.path.join(gen_dir, "stray.txt"), "w") as fh:
+        fh.write("nobody claimed me")
+    assert any("stray.txt" in p for p in ppg3.verify_generation(project_dir))

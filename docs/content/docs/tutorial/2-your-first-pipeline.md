@@ -11,7 +11,7 @@ We'll define two jobs and run them. Add to `pipeline.py` (below the
 ```python
 # 1. A shell command that writes a greeting file.
 greeting = ppg3.CommandJob(
-    view={"greeting": "greeting.txt"},
+    outputs={"greeting": "greeting.txt"},
     argv=["/bin/sh", "-c", "echo hello > {out:greeting}"],
 )
 
@@ -23,7 +23,7 @@ def make_summary(io):
         fh.write(text.strip().upper())
 
 ppg3.FileJob(
-    view={"summary": "summary.txt"},
+    outputs={"summary": "summary.txt"},
     run=make_summary,
     inputs={"greeting": greeting},
 )
@@ -50,13 +50,13 @@ Open `outputs/summary.txt` — it says `HELLO`.
 
 Let's understand every piece.
 
-## The `view=` argument — naming your outputs
+## The `outputs=` argument — publishing your outputs
 
 Every job that produces files declares a **view**: a dict mapping an
 **output name** to a **view-relative path**.
 
 ```python
-view={"greeting": "greeting.txt"}
+outputs={"greeting": "greeting.txt"}
 #      ^output name  ^where it shows up in outputs/
 ```
 
@@ -74,7 +74,7 @@ directory of named results. More on that in
 
 ```python
 ppg3.CommandJob(
-    view={"greeting": "greeting.txt"},
+    outputs={"greeting": "greeting.txt"},
     argv=["/bin/sh", "-c", "echo hello > {out:greeting}"],
 )
 ```
@@ -107,7 +107,7 @@ def make_summary(io):
         fh.write(text.strip().upper())
 
 ppg3.FileJob(
-    view={"summary": "summary.txt"},
+    outputs={"summary": "summary.txt"},
     run=make_summary,
     inputs={"greeting": greeting},
 )

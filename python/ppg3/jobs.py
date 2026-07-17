@@ -1,39 +1,40 @@
-"""Job classes + ``Graph`` (PPG3_DESIGN.md §7, CONTRACT.md "Scheduler" for the
-``JobDef`` JSON shape).
+"""Job classes + ``Graph`` (PRINCIPLES.md P1/P2/P10; PPG3_DESIGN.md §7,
+CONTRACT.md "Scheduler" for the ``JobDef`` JSON shape).
+
+Identity is content, not names (P1): a job's id is derived from its
+*definition fingerprint* (recipe, inputs, outputs, env, runtime, publish
+targets) — users never name jobs, two identical definitions merge into one
+job, and the only definition-time conflict is two *different* jobs claiming
+the same publish destination (P2), reported with both definition sites.
+
+Publishing is spelled ``outputs=`` (P10): a dict mapping output *names* (how
+the job itself refers to its files, and how they are laid out inside the
+store entry — see P1.4) to destinations in the output tree. ``outputs`` is
+optional — a job without it is an internal job that simply doesn't appear in
+the output tree.
 
 Each job's ``.job_def(graph)`` method assembles the CONTRACT.md ``JobDef``
 dict (destined for ``ppg3._core.run(jobs_json, ...)``); nothing here ever
 imports the compiled extension directly — leaf-file/tool hashing needs real
 I/O (stat-cache, optionally ``nix build``) but no Rust.
 
-Rust-serde shape note (reconciled against the real
-``core/src/scheduler.rs``, see STATUS.md): the assumption made while that
-module was still a placeholder — plain serde-default *externally tagged*
-JSON (unit variants as bare strings, e.g. ``"InProcess"``/``"Default"``;
-struct/tuple variants as ``{"VariantName": {...}}``/``{"VariantName":
-value}``) — turned out to match the landed Rust exactly, so
-`_retain_json`/`exec_template`/`_lower_input` below are unchanged. Two
-things *did* need reconciling once `scheduler.rs` landed for real:
-
-- ``JobDef.graph_job: bool`` (``#[serde(default)]`` in Rust, so its absence
-  was never a hard error, but a ``GraphJob`` that omits it is silently
-  treated as a plain ``InProcess`` "loader layer" job and gets
-  ``run_in_process`` called on it instead of ``expand_graph_job`` — every
-  ``job_def()`` below now sets it explicitly).
-- Shim spec delivery (see ``_shim_argv`` below and STATUS.md): resolved by
-  passing per-name real/virtual paths as individual argv tokens (each
-  containing exactly one ``{in:NAME}``/``{out:NAME}``/``{tool:NAME}``
-  placeholder, so the scheduler's naive first-``{``/first-``}`` token
-  scanner in ``lower_argv`` resolves them correctly) rather than embedding
-  paths inside the base64 spec blob.
+Rust-serde shape note: plain serde-default *externally tagged* JSON (unit
+variants as bare strings, e.g. ``"InProcess"``/``"Default"``; struct/tuple
+variants as ``{"VariantName": {...}}``). The wire field ``view`` carries the
+publish map (kept under its old wire name; the Rust side uses it only as
+informational manifest metadata since P1.4 moved entry layout onto output
+names).
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import inspect
 import json
 import os
+import sysconfig
+import uuid
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -192,6 +193,62 @@ def serialize_argv(argv: Sequence[Any]) -> list:
 
 
 # --------------------------------------------------------------------------
+# Definition sites (P1.5/P9.1: how humans find their jobs)
+# --------------------------------------------------------------------------
+
+# Absolute directory of the `ppg3` package itself — call-site walks skip
+# frames inside it.
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_STDLIB_DIR = sysconfig.get_paths().get("stdlib", "") or "\x00never"
+
+
+def _is_user_frame(filename: str) -> bool:
+    if filename.startswith("<"):  # <frozen ...>, <string>, REPL
+        return False
+    if filename == _PKG_DIR or filename.startswith(_PKG_DIR + os.sep):
+        return False
+    if filename.startswith(_STDLIB_DIR):
+        return False
+    if f"{os.sep}site-packages{os.sep}" in filename or f"{os.sep}dist-packages{os.sep}" in filename:
+        return False
+    return True
+
+
+def _user_call_chain(limit: int = 2) -> List[Tuple[str, int]]:
+    """Up to ``limit`` user-code ``(file, line)`` frames, innermost first,
+    walking out from the job constructor: the definition site, plus the
+    caller of a wrapper function if there is one. This is how every report
+    refers back to a job (P1.5) — the id itself is never shown alone."""
+    frames: List[Tuple[str, int]] = []
+    frame = inspect.currentframe()
+    try:
+        if frame is None:  # pragma: no cover
+            return frames
+        frame = frame.f_back
+        while frame is not None and len(frames) < limit:
+            filename = os.path.abspath(frame.f_code.co_filename)
+            if _is_user_frame(filename) and os.path.isfile(filename):
+                frames.append((filename, frame.f_lineno))
+            frame = frame.f_back
+        return frames
+    finally:
+        del frame
+
+
+def _record_call_site() -> Optional[Tuple[str, int]]:
+    """Best-effort ``(file, lineno)`` of the first stack frame outside the
+    ``ppg3`` package (the §7.6 TOFU patch target and the jj source file)."""
+    chain = _user_call_chain(limit=1)
+    return chain[0] if chain else None
+
+
+def _format_defsite(chain: Sequence[Tuple[str, int]]) -> str:
+    if not chain:
+        return "<unknown definition site>"
+    return " ← ".join(f"{f}:{l}" for f, l in chain)
+
+
+# --------------------------------------------------------------------------
 # Graph
 # --------------------------------------------------------------------------
 
@@ -207,6 +264,7 @@ class Graph:
         paranoid: bool,
         forkserver: bool = True,
         jj: bool = False,
+        sandbox: str = "auto",
     ):
         self.stores = list(stores)
         self.default_python = default_python
@@ -218,28 +276,29 @@ class Graph:
         # on job sources not tracked in the enclosing jj workspace and
         # captures commit/change/op-log ids into the generation meta.
         self.jj = jj
+        # PRINCIPLES.md P6: "require" (error at run start if enforcement is
+        # unavailable) | "auto" (best available, warn once per run when
+        # downgraded) | "off" (explicit, silent).
+        if sandbox not in ("require", "auto", "off"):
+            raise DefinitionError(
+                f"ppg3.new(sandbox={sandbox!r}): expected \"require\", "
+                "\"auto\", or \"off\""
+            )
+        self.sandbox = sandbox
         # §6.4: warm template processes for python FileJob/DataJob/FetchJob
         # dispatch. `False` disables it (`run.py` then passes an empty
-        # `template_argv` to `ppg3._core.run`, which makes the Rust
-        # `ForkserverExecutor` behave exactly like the pre-forkserver bare
-        # `NoneExecutor` for every job — see STATUS.md).
+        # `template_argv` to `ppg3._core.run`).
         self.forkserver = forkserver
         self.jobs: Dict[str, "Job"] = {}
         self.data_job_ids: Set[str] = set()
+        # P2: destination -> claiming job. The ONLY definition-time
+        # uniqueness constraint in the system.
+        self.claims: Dict[str, "Job"] = {}
         self._statcache: Optional[StatCache] = None
         # §6.7 watch mode: paths that should trigger a re-run of the
-        # definition pass on change. Populated during job definition
-        # (`Source` callback file + includes, recorded at __init__ time) and
-        # during lowering (`ppg3.File(...)` leaf inputs, recorded from
-        # `_lower_input` when `job_defs()`/`job_def()` runs — see
-        # CONTRACT.md "Python package" watch addendum). Never includes the
-        # pipeline script itself; `python -m ppg3 watch` adds that.
+        # definition pass on change.
         self._watched_paths: Set[str] = set()
-        # jj support: files that *define* jobs — constructor call sites,
-        # callback source files, Source refs + includes. Distinct from
-        # `_watched_paths`, which additionally holds leaf *data* inputs
-        # (`ppg3.File`) — data files need not be under version control,
-        # job sources (with jj=True) must.
+        # jj support: files that *define* jobs.
         self._source_paths: Set[str] = set()
 
     def record_watched_path(self, path: Union[str, "os.PathLike"]) -> None:
@@ -251,26 +310,33 @@ class Graph:
         self._source_paths.add(str(path))
 
     def source_paths(self) -> List[str]:
-        """Sorted, de-duplicated snapshot of every job-source file recorded
-        so far: job-constructor call sites, callback source files, and
-        ``Source`` refs + includes. What ``run()`` hands to
-        ``jj.assert_sources_tracked`` when ``jj=True``."""
         return sorted(self._source_paths)
 
     def watched_paths(self) -> List[str]:
-        """Sorted, de-duplicated snapshot of every path recorded so far via
-        :meth:`record_watched_path` (leaf ``File`` inputs + ``Source``
-        callback files/includes). Does not include the pipeline script
-        itself — the caller (``python -m ppg3 watch``) adds that."""
         return sorted(self._watched_paths)
 
     def add(self, job: "Job") -> "Job":
+        """Register `job`. Identical redefinition (same fingerprint) merges
+        (P2.3); a contested destination is the only conflict (P2.1), and its
+        error points at both definition sites."""
         existing = self.jobs.get(job.id)
-        if existing is not None and existing is not job:
-            raise DefinitionError(
-                f"duplicate job id {job.id!r} (job ids are derived from `view`; "
-                "pass name= to disambiguate two jobs that would otherwise share one)"
-            )
+        if existing is not None:
+            # Same fingerprint = the same job, stated twice. The new object
+            # shares the id, so anything referencing it lowers to the
+            # registered one.
+            return existing
+        for dest in job.publish.values():
+            claimant = self.claims.get(dest)
+            if claimant is not None and claimant.id != job.id:
+                raise DefinitionError(
+                    f"two different jobs both publish {dest!r}:\n"
+                    f"  first:  defined at {claimant.defsite}\n"
+                    f"  second: defined at {job.defsite}\n"
+                    "one destination, one producer — change one of the paths "
+                    "(identical jobs would have merged; these differ)"
+                )
+        for dest in job.publish.values():
+            self.claims[dest] = job
         self.jobs[job.id] = job
         return job
 
@@ -301,22 +367,21 @@ def new(
     paranoid: bool = False,
     forkserver: bool = True,
     jj: bool = False,
+    sandbox: str = "auto",
 ) -> Graph:
     """Create (and make current) a new ``Graph``. Module-level "current
     graph" like ppg2 — job constructors look it up implicitly.
 
+    ``sandbox=`` (PRINCIPLES.md P6): ``"require"`` errors at run start when
+    real enforcement (bwrap + nix) is unavailable; ``"auto"`` (default) uses
+    the best available enforcement and warns exactly once per run when
+    running unenforced; ``"off"`` opts out silently.
+
     ``forkserver=True`` (the default, §6.4): python `FileJob`/`DataJob`/
     `FetchJob` dispatch runs through warm per-``(PyEnv, preload)`` template
     processes instead of a cold ``python -I -m ppg3._shim`` exec per job.
-    Pass ``forkserver=False`` to opt out and get the old cold-exec-per-job
-    behavior unconditionally (e.g. for isolating whether a bug is
-    forkserver-related).
 
-    ``jj=True`` enables jj (jujutsu) support (see :mod:`ppg3.jj`): ``run()``
-    then hard-errors if any job-source file is not tracked in the enclosing
-    jj workspace, and records the jj commit/change/op-log ids into the
-    generation's metadata (``ppg3 generations list`` shows them; ``ppg3 gc``
-    prunes uncommitted "op-log" generations under a separate budget).
+    ``jj=True`` enables jj (jujutsu) support (see :mod:`ppg3.jj`).
     """
     global _current_graph
     if frozen is None:
@@ -336,6 +401,7 @@ def new(
         paranoid=paranoid,
         forkserver=forkserver,
         jj=jj,
+        sandbox=sandbox,
     )
     _current_graph = graph
     return graph
@@ -349,15 +415,21 @@ def _require_current_graph() -> Graph:
     return _current_graph
 
 
-def _derive_id(view: Any, kind: str, name: Optional[str] = None) -> str:
-    if name:
-        return name
-    if isinstance(view, str):
-        return view
-    if isinstance(view, dict) and view:
-        return "+".join(sorted(view.values()))
+def _normalize_outputs(outputs: Any, kind: str) -> Dict[str, str]:
+    """``outputs=`` (P10): None (internal job) | dict name -> destination."""
+    if outputs is None:
+        return {}
+    if isinstance(outputs, dict):
+        for k, v in outputs.items():
+            if not isinstance(k, str) or not isinstance(v, str) or not k or not v:
+                raise DefinitionError(
+                    f"{kind}(outputs=...): expected a dict of output-name -> "
+                    f"output-tree path (both non-empty str); got {k!r}: {v!r}"
+                )
+        return dict(outputs)
     raise DefinitionError(
-        f"{kind}: cannot derive a stable job id from view={view!r}; pass name="
+        f"{kind}(outputs=...): expected a dict of output-name -> output-tree "
+        f"path, or None for an internal job; got {type(outputs).__name__}"
     )
 
 
@@ -389,9 +461,8 @@ def _lower_input(input_name: str, value: Any, graph: Graph) -> Dict[str, Any]:
         h = graph.statcache().hash_file(value.path)
         # A File is BOTH a change-detection dependency (its content hash, the
         # only thing that enters the input key) AND a mounted read-only input
-        # bound at /ppg/in/<name> — the `source` is carried out-of-band and
-        # never keyed, so it does not perturb the ik. Absolute so the mount
-        # resolves regardless of the run's cwd.
+        # bound at /ppg/in/<name> (P4.1) — the `source` is carried out-of-band
+        # and never keyed. Absolute so the mount resolves regardless of cwd.
         return {"File": {"hash": h, "source": os.path.abspath(value.path)}}
     if isinstance(value, Params):
         h = canon.input_key_local(value.canonical())
@@ -402,6 +473,20 @@ def _lower_input(input_name: str, value: Any, graph: Graph) -> Dict[str, Any]:
     )
 
 
+def _fingerprint_input(value: Any) -> Any:
+    """Definition-time identity of one input (no I/O — this must work before
+    any store/stat-cache exists, because it feeds the job id)."""
+    if isinstance(value, OutputRef):
+        return ["subset", value.job.id, value.name]
+    if isinstance(value, Job):
+        return ["job", value.id]
+    if isinstance(value, File):
+        return ["file", os.path.abspath(value.path)]
+    if isinstance(value, Params):
+        return ["params", value.canonical()]
+    return ["other", repr(value)]
+
+
 def _lower_tools(tools: Sequence[ToolSpec]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for t in tools:
@@ -409,6 +494,16 @@ def _lower_tools(tools: Sequence[ToolSpec]) -> Dict[str, str]:
             raise DefinitionError(f"duplicate tool name {t.name!r}")
         out[t.name] = t.resolve().hash
     return out
+
+
+def _fingerprint_tools(tools: Sequence[ToolSpec]) -> list:
+    return sorted([t.name, t.kind, t.ref_or_path] for t in tools)
+
+
+def _fingerprint_pyenv(python_env: Optional[PyEnv]) -> Any:
+    if python_env is None:
+        return None
+    return [python_env.kind, python_env.flake_ref, list(python_env.preload)]
 
 
 def _runtime_doc(python_env: Optional[PyEnv]) -> Dict[str, Any]:
@@ -423,7 +518,7 @@ def _runtime_doc(python_env: Optional[PyEnv]) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Shim spec delivery (see module docstring + STATUS.md "shim stdin question")
+# Shim spec delivery (see STATUS.md "shim stdin question")
 # --------------------------------------------------------------------------
 
 
@@ -432,12 +527,9 @@ def _b64_json(obj: Any) -> str:
 
 
 def _mounted_input_names(inputs: Dict[str, Any]) -> List[str]:
-    """Input names backed by a real mounted path, i.e. those `{in:NAME}` /
-    ``io.input(NAME)`` resolve to a path for: ``Job``/``JobSubset`` refs
-    (parent output entries) and ``File`` refs (a host file bound read-only).
-    A ``Params`` (`Leaf`) ref has no mount — the scheduler's `{in:NAME}`
-    resolution errors if asked for one; params arrive via ``io.params``
-    instead (see `resolve_placeholder` in scheduler.rs)."""
+    """Input names backed by a real mounted path (P4: every declared input
+    is readable): ``Job``/``JobSubset`` refs and ``File`` refs. A ``Params``
+    (`Leaf`) ref has no mount; params arrive via ``io.params``."""
     return sorted(
         n for n, v in inputs.items() if isinstance(v, (Job, OutputRef, File))
     )
@@ -457,15 +549,11 @@ def _shim_argv(
     tool_names: Sequence[str],
 ) -> List[str]:
     """Build the ``python -I -m ppg3._shim`` argv (CONTRACT.md addendum,
-    "Shim spec delivery"): the static part of the spec (transport, params,
-    pickle_output/fetch url+hash — no paths) travels as one base64 JSON
-    blob (``--spec-b64``); every real/virtual path travels as its own argv
-    token carrying exactly one ``{in:NAME}``/``{out:NAME}``/``{tool:NAME}``
-    placeholder so the scheduler's `lower_argv` (and, for `NoneExecutor`,
-    its `/ppg/` string-rewrite) can resolve it — embedding those
-    placeholders *inside* the JSON blob does not work, since `lower_argv`
-    scans for the first ``{``/``}`` pair in the whole token and JSON's own
-    structural braces collide with that (see STATUS.md for the trace)."""
+    "Shim spec delivery"): the static part of the spec travels as one base64
+    JSON blob (``--spec-b64``); every real/virtual path travels as its own
+    argv token carrying exactly one ``{in:NAME}``/``{out:NAME}``/
+    ``{tool:NAME}`` placeholder so the scheduler's `lower_argv` can resolve
+    it."""
     argv = [
         python_env.executable_hint(),
         "-I",
@@ -504,23 +592,63 @@ def _callable_source_file(fn: Callable) -> Optional[str]:
 class Job:
     kind = "base"
 
-    def __init__(self, graph: Graph, job_id: str, view: Dict[str, str]):
+    def __init__(self, graph: Graph, publish: Dict[str, str]):
         self.graph = graph
-        self.id = job_id
-        self.view = dict(view) if view else {}
+        # P10: the publish map, output name -> destination in the output
+        # tree. May be empty (internal job).
+        self.publish = dict(publish) if publish else {}
+        # P1.5: how humans find this job.
+        self.defsite_chain = _user_call_chain()
         # jj support: the file this job constructor was called from is a
-        # job-source file (this is how the pipeline script itself, and any
-        # module defining e.g. callback-less CommandJobs, gets recorded).
-        site = _record_call_site()
-        if site is not None:
-            graph.record_source_path(site[0])
-        graph.add(self)
+        # job-source file.
+        if self.defsite_chain:
+            graph.record_source_path(self.defsite_chain[0][0])
+
+    # -- identity (P1) ------------------------------------------------
+
+    def _fingerprint_doc(self) -> Dict[str, Any]:
+        """Definition fingerprint: everything that makes this job *this*
+        job. Subclasses extend. Two jobs with equal fingerprints are the
+        same job (dedup/merge); the id derives from this and nothing else —
+        there is no user-assignable name."""
+        return {
+            "kind": self.kind,
+            "publish": dict(sorted(self.publish.items())),
+        }
+
+    def _register(self) -> None:
+        """Compute the id from the fingerprint and register with the graph.
+        Must be the last statement of every concrete ``__init__``."""
+        doc = json.dumps(self._fingerprint_doc(), sort_keys=True, default=repr)
+        self.id = "j" + hashlib.sha256(doc.encode("utf-8")).hexdigest()[:16]
+        self.graph.add(self)
+
+    # -- display (P1.5) -----------------------------------------------
+
+    @property
+    def defsite(self) -> str:
+        return _format_defsite(self.defsite_chain)
+
+    @property
+    def label(self) -> str:
+        """The human name of this job: its published destinations, or its
+        definition site for internal jobs. Never the internal id."""
+        if self.publish:
+            return "+".join(sorted(self.publish.values()))
+        site = self.defsite_chain[0] if self.defsite_chain else None
+        where = f"{os.path.basename(site[0])}:{site[1]}" if site else "?"
+        return f"<{self.kind} @ {where}>"
 
     def __getitem__(self, name: str) -> OutputRef:
         return OutputRef(self, name)
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.id!r})"
+        return f"{type(self).__name__}({self.label!r})"
+
+    def output_names(self) -> List[str]:
+        """Declared output names — entry-internal layout (P1.4). Defaults to
+        the publish map's keys; subclasses with fixed names override."""
+        return sorted(self.publish.keys())
 
     def job_def(self, graph: Optional[Graph] = None) -> Dict[str, Any]:
         raise NotImplementedError
@@ -538,8 +666,8 @@ class FileJob(Job):
 
     def __init__(
         self,
-        view: Dict[str, str],
-        run: Union[Callable, Source],
+        outputs: Optional[Dict[str, str]] = None,
+        run: Union[Callable, Source, None] = None,
         tools: Sequence[ToolSpec] = (),
         inputs: Optional[Dict[str, Any]] = None,
         env: Optional[Dict[str, str]] = None,
@@ -547,23 +675,20 @@ class FileJob(Job):
         retain: Any = None,
         python: Optional[PyEnv] = None,
         store: Optional[str] = None,
-        name: Optional[str] = None,
     ):
         """
-        view   = what files do we track?
-        run    = what do we execute
-        tools  = what's in the sandbox?
-        inputs = upstream jobs
-        env    = environment variables
-        python = Python environment
-        retain = Retain.Default | Retain.Evict | Retain.Pin - GC behaviour.
-
+        outputs = output name -> output-tree destination (optional: omit
+                  for an internal job that is not published)
+        run     = what we execute (callable or ppg3.Source)
+        tools   = what's in the sandbox
+        inputs  = upstream jobs / files / params
+        env     = environment variables (declared = keyed + visible, P5.4)
+        python  = Python environment
+        retain  = Retain.Default | Retain.Evict | Retain.Pin - GC behaviour
         """
-        if not isinstance(view, dict):
-            raise DefinitionError(
-                "FileJob(view=...) must be a non-empty dict of output-name -> "
-                "view-relative path"
-            )
+        if run is None:
+            raise DefinitionError("FileJob requires run= (a callable or ppg3.Source)")
+        publish = _normalize_outputs(outputs, "FileJob")
         graph = _require_current_graph()
         python_env = python or graph.default_python
         if python_env is None:
@@ -571,14 +696,12 @@ class FileJob(Job):
                 "FileJob requires a PyEnv: pass python=... or set "
                 "ppg3.new(default_python=...)"
             )
-        job_id = name or _derive_id(view, "FileJob")
-        super().__init__(graph, job_id, view)
+        super().__init__(graph, publish)
         self.run = run
         if isinstance(run, Source):
             # §6.7 watch mode: Source callback files are watched paths,
-            # recorded at definition time (as opposed to leaf File inputs,
-            # recorded at lowering time in `_lower_input`). They are also
-            # job-source files for jj tracking enforcement.
+            # recorded at definition time. They are also job-source files
+            # for jj tracking enforcement.
             graph.record_watched_path(run.path)
             graph.record_source_path(run.path)
             for inc in run.includes:
@@ -596,6 +719,27 @@ class FileJob(Job):
         self.python_env = python_env
         self.store = store
         self._transport = select_transport(run, python_env, paranoid=graph.paranoid)
+        self._register()
+
+    def _fingerprint_doc(self) -> Dict[str, Any]:
+        doc = super()._fingerprint_doc()
+        doc.update(
+            {
+                "recipe": self._transport["recipe"],
+                "inputs": {
+                    n: _fingerprint_input(v) for n, v in sorted(self.inputs.items())
+                },
+                "tools": _fingerprint_tools(self.tools),
+                "env": dict(sorted(self.env.items())),
+                "resources": dict(sorted(self.resources.items())),
+                "retain": repr(self.retain),
+                "store": self.store,
+                "pyenv": _fingerprint_pyenv(self.python_env),
+                "pickle_output": self._pickle_output,
+                "output_names": self.output_names(),
+            }
+        )
+        return doc
 
     def job_def(self, graph: Optional[Graph] = None) -> Dict[str, Any]:
         graph = graph or self.graph
@@ -612,7 +756,7 @@ class FileJob(Job):
             self.python_env,
             static_spec,
             _mounted_input_names(self.inputs),
-            sorted(self.view.keys()),
+            self.output_names(),
             [t.name for t in self.tools],
         )
         return {
@@ -622,7 +766,7 @@ class FileJob(Job):
             "tools": _lower_tools(self.tools),
             "runtime": _runtime_doc(self.python_env),
             "env": dict(self.env),
-            "outputs_declared": sorted(self.view.keys()),
+            "outputs_declared": self.output_names(),
             "resources": dict(self.resources),
             "store_target": self.store,
             "retain": _retain_json(self.retain),
@@ -632,7 +776,7 @@ class FileJob(Job):
                     "allow_network": False,
                 }
             },
-            "view": dict(self.view),
+            "view": dict(self.publish),
             "fixed_output": None,
             "graph_job": False,
         }
@@ -648,24 +792,20 @@ class CommandJob(Job):
 
     def __init__(
         self,
-        view: Dict[str, str],
-        argv: Sequence[Any],
+        outputs: Optional[Dict[str, str]] = None,
+        argv: Optional[Sequence[Any]] = None,
         tools: Sequence[ToolSpec] = (),
         inputs: Optional[Dict[str, Any]] = None,
         env: Optional[Dict[str, str]] = None,
         resources: Optional[Resources] = None,
         retain: Any = None,
         store: Optional[str] = None,
-        name: Optional[str] = None,
     ):
-        if not isinstance(view, dict) or not view:
-            raise DefinitionError(
-                "CommandJob(view=...) must be a non-empty dict of output-name -> "
-                "view-relative path"
-            )
+        if argv is None:
+            raise DefinitionError("CommandJob requires argv=")
+        publish = _normalize_outputs(outputs, "CommandJob")
         graph = _require_current_graph()
-        job_id = name or _derive_id(view, "CommandJob")
-        super().__init__(graph, job_id, view)
+        super().__init__(graph, publish)
         self.argv_template = serialize_argv(argv)
         self.tools = list(tools)
         self.inputs = dict(inputs or {})
@@ -674,6 +814,25 @@ class CommandJob(Job):
         self.retain = retain if retain is not None else Retain.Default
         self.store = store
         self._recipe = recipe.recipe_hash_command(self.argv_template)
+        self._register()
+
+    def _fingerprint_doc(self) -> Dict[str, Any]:
+        doc = super()._fingerprint_doc()
+        doc.update(
+            {
+                "recipe": self._recipe,
+                "inputs": {
+                    n: _fingerprint_input(v) for n, v in sorted(self.inputs.items())
+                },
+                "tools": _fingerprint_tools(self.tools),
+                "env": dict(sorted(self.env.items())),
+                "resources": dict(sorted(self.resources.items())),
+                "retain": repr(self.retain),
+                "store": self.store,
+                "output_names": self.output_names(),
+            }
+        )
+        return doc
 
     def job_def(self, graph: Optional[Graph] = None) -> Dict[str, Any]:
         graph = graph or self.graph
@@ -687,14 +846,14 @@ class CommandJob(Job):
             "tools": _lower_tools(self.tools),
             "runtime": {"python_env": None, "preload": [], "shim": "0"},
             "env": dict(self.env),
-            "outputs_declared": sorted(self.view.keys()),
+            "outputs_declared": self.output_names(),
             "resources": dict(self.resources),
             "store_target": self.store,
             "retain": _retain_json(self.retain),
             "exec_template": {
                 "Argv": {"argv": list(self.argv_template), "allow_network": False}
             },
-            "view": dict(self.view),
+            "view": dict(self.publish),
             "fixed_output": None,
             "graph_job": False,
         }
@@ -710,65 +869,41 @@ class DataJob(FileJob):
 
     The shim pickles the callback's return value to ``data.pickle``;
     consumers declare this job as an input and call ``io.load(name)``.
+    ``outputs`` is a single destination path (or None: an internal data
+    artifact, consumed by other jobs but not published).
     """
 
     kind = "data"
     OUTPUT_NAME = "data.pickle"
     _pickle_output = True
 
-    def __init__(self, view: Union[str, Dict[str, str]], run: Union[Callable, Source], **kwargs):
-        if isinstance(view, str):
-            view_map = {self.OUTPUT_NAME: view}
-        elif isinstance(view, dict):
-            if set(view.keys()) != {self.OUTPUT_NAME}:
-                raise DefinitionError(
-                    f"DataJob(view=...) as a dict must have exactly the key "
-                    f"{self.OUTPUT_NAME!r}; got {sorted(view.keys())}. Pass a "
-                    "plain str for the common case."
-                )
-            view_map = dict(view)
+    def __init__(
+        self,
+        outputs: Optional[str] = None,
+        run: Union[Callable, Source, None] = None,
+        **kwargs,
+    ):
+        if outputs is None:
+            publish: Dict[str, str] = {}
+        elif isinstance(outputs, str):
+            publish = {self.OUTPUT_NAME: outputs}
         else:
             raise DefinitionError(
-                "DataJob(view=...) must be a str (view-relative path) or "
-                f"{{{self.OUTPUT_NAME!r}: path}}"
+                "DataJob(outputs=...) must be a single output-tree path "
+                "(str), or None for an internal data artifact"
             )
-        super().__init__(view=view_map, run=run, **kwargs)
+        super().__init__(outputs=publish, run=run, **kwargs)
         self.graph.data_job_ids.add(self.id)
 
+    def output_names(self) -> List[str]:
+        # The pickle artifact exists (and is keyed, P1.4) whether or not it
+        # is published.
+        return [self.OUTPUT_NAME]
+
 
 # --------------------------------------------------------------------------
-# FetchJob + TOFU call-site recording (§7.6)
+# FetchJob (§7.6; PRINCIPLES.md P7 — the pin is the identity)
 # --------------------------------------------------------------------------
-
-# Absolute directory of the `ppg3` package itself — used by `_record_call_site`
-# below to find the first stack frame *outside* the package, i.e. the user's
-# own call site, per §7.6's TOFU DECISION ("at definition time each FetchJob
-# records its call site (`inspect` — file, line)").
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _record_call_site() -> Optional[Tuple[str, int]]:
-    """Best-effort ``(file, lineno)`` of the first stack frame outside the
-    ``ppg3`` package, walking up from this function's caller (``FetchJob.
-    __init__``). Returns ``None`` if no such frame exists (e.g. called from
-    an interactive ``-c``/REPL frame with no real file, or the stack was
-    exhausted) — the TOFU pass (``tofu.py``) treats that as "cannot patch,
-    goes to the table" rather than erroring."""
-    frame = inspect.currentframe()
-    try:
-        if frame is None:  # pragma: no cover - not all Python impls have frames
-            return None
-        frame = frame.f_back  # the caller of _record_call_site (FetchJob.__init__)
-        while frame is not None:
-            filename = os.path.abspath(frame.f_code.co_filename)
-            if filename != _PKG_DIR and not filename.startswith(_PKG_DIR + os.sep):
-                if not os.path.isfile(filename):
-                    return None
-                return (filename, frame.f_lineno)
-            frame = frame.f_back
-        return None
-    finally:
-        del frame
 
 
 class FetchJob(Job):
@@ -777,32 +912,38 @@ class FetchJob(Job):
 
     def __init__(
         self,
-        view: str,
-        url: str,
+        outputs: Optional[str] = None,
+        url: Optional[str] = None,
         blake3: Optional[str] = None,
         retain: Any = None,
         store: Optional[str] = None,
-        name: Optional[str] = None,
     ):
-        if not isinstance(view, str):
-            raise DefinitionError("FetchJob(view=...) must be a single path string")
+        if url is None:
+            raise DefinitionError("FetchJob requires url=")
+        if outputs is None:
+            publish: Dict[str, str] = {}
+        elif isinstance(outputs, str):
+            publish = {self.OUTPUT_NAME: outputs}
+        else:
+            raise DefinitionError(
+                "FetchJob(outputs=...) must be a single output-tree path "
+                "(str), or None for an internal fetch"
+            )
         graph = _require_current_graph()
         if blake3 is None and graph.frozen:
             raise DefinitionError(
-                f"FetchJob(view={view!r}, url={url!r}): blake3=None is rejected "
-                "in --frozen mode (the default outside an interactive terminal, "
-                "or under CI). TOFU (trust-on-first-use, §7.6) is an interactive-"
-                "only escape hatch; --frozen never TOFUs — pin the hash by hand "
-                "or run interactively once to let ppg3 patch it in for you."
+                f"FetchJob(outputs={outputs!r}, url={url!r}): blake3=None is "
+                "rejected in --frozen mode (the default outside an interactive "
+                "terminal, or under CI). TOFU (trust-on-first-use, §7.6) is an "
+                "interactive-only escape hatch; --frozen never TOFUs — pin the "
+                "hash by hand or run interactively once to let ppg3 patch it "
+                "in for you."
             )
-        job_id = name or view
-        super().__init__(graph, job_id, {self.OUTPUT_NAME: view})
+        super().__init__(graph, publish)
         self.url = url
         self.blake3 = blake3
         # §7.6 TOFU: recorded unconditionally (cheap), consumed only for
-        # jobs actually defined with blake3=None (see tofu.py). Multiple
-        # FetchJobs may share one call site (a loop over URLs) — detected
-        # later by `tofu.run_tofu_pass`'s grouping, not here.
+        # jobs actually defined with blake3=None (see tofu.py).
         self._call_site = _record_call_site()
         self.retain = retain if retain is not None else Retain.Default
         self.store = store
@@ -813,26 +954,60 @@ class FetchJob(Job):
                 "fetch shim invocation"
             )
         self.python_env = python_env
-        self._recipe = canon.input_key_local(
-            canon.canonicalize_value({"kind": "fetch", "url": url}, "$.fetch")
+        # P7.1: the pin participates in the identity — (url, expected hash)
+        # IS the fetch. An unpinned fetch (blake3=None, interactive TOFU)
+        # means "trust the next download": it gets a one-shot key (never a
+        # memo hit), and the TOFU pass aliases the *pinned* key onto the
+        # entry it produces so the patched-source run hits (see tofu.py).
+        self._recipe = self._recipe_for_pin(
+            blake3 if blake3 is not None else {"tofu_one_shot": uuid.uuid4().hex}
+        )
+        self._register()
+
+    @staticmethod
+    def _recipe_for_pin(pin: Any) -> str:
+        return canon.input_key_local(
+            canon.canonicalize_value({"kind": "fetch", "blake3": pin}, "$.fetch")
         )
 
+    def _fingerprint_doc(self) -> Dict[str, Any]:
+        doc = super()._fingerprint_doc()
+        doc.update(
+            {
+                "url": self.url,
+                "blake3": self.blake3,
+                "recipe": self._recipe,
+                "retain": repr(self.retain),
+                "store": self.store,
+            }
+        )
+        return doc
+
+    def output_names(self) -> List[str]:
+        return [self.OUTPUT_NAME]
+
     def job_def(self, graph: Optional[Graph] = None) -> Dict[str, Any]:
-        static_spec = {"mode": "fetch", "url": self.url, "blake3": self.blake3}
+        return self._job_def_for(self._recipe, self.blake3)
+
+    def pinned_job_def(self, digest: str) -> Dict[str, Any]:
+        """The JobDef this job will lower to once ``blake3=digest`` is
+        pinned into the source — what the TOFU pass derives the pinned input
+        key from (P7.2), so the very next run hits instead of re-downloading
+        what it just fetched."""
+        return self._job_def_for(self._recipe_for_pin(digest), digest)
+
+    def _job_def_for(self, recipe_hash: str, fixed_output: Optional[str]) -> Dict[str, Any]:
+        static_spec = {"mode": "fetch", "url": self.url, "blake3": fixed_output}
         argv = _shim_argv(self.python_env, static_spec, [], [self.OUTPUT_NAME], [])
         return {
             "id": self.id,
-            "recipe": self._recipe,
-            "inputs": {},
+            "recipe": recipe_hash,
+            # The URL is provenance, not identity-of-content — but changing
+            # it must refetch (P7.3): it rides in the key as a leaf input.
+            "inputs": {"url": {"Leaf": {"hash": canon.input_key_local(self.url)}}},
             "tools": {},
-            # A fetch's identity is (url, expected content) — NOT the local
-            # Python environment. The download is performed by a trivial,
-            # env-independent shim, so the interpreter that happens to run it
-            # must not enter the key (otherwise a pinned URL re-downloads
-            # whenever the PyEnv hash shifts). `python_env` is still used to
-            # *execute* the shim via argv[0] (`executable_hint`, which is not
-            # part of the key document). `shim` is kept so shim-logic changes
-            # still invalidate.
+            # A fetch's identity is (url, pin) — NOT the local Python
+            # environment; the shim that downloads is env-independent.
             "runtime": {"python_env": None, "preload": [], "shim": SHIM_VERSION},
             "env": {},
             "outputs_declared": [self.OUTPUT_NAME],
@@ -845,8 +1020,8 @@ class FetchJob(Job):
                     "allow_network": True,
                 }
             },
-            "view": dict(self.view),
-            "fixed_output": self.blake3,
+            "view": dict(self.publish),
+            "fixed_output": fixed_output,
             "graph_job": False,
         }
 
@@ -863,17 +1038,20 @@ class GraphJob(Job):
 
     kind = "graph"
 
-    def __init__(self, fn: Callable, name: Optional[str] = None):
+    def __init__(self, fn: Callable):
         graph = _require_current_graph()
-        job_id = name or getattr(fn, "__qualname__", None)
-        if not job_id:
-            raise DefinitionError("GraphJob(fn) requires name= if fn has no __qualname__")
-        super().__init__(graph, job_id, {})
+        super().__init__(graph, {})
         self.fn = fn
         src = _callable_source_file(fn)
         if src is not None:
             graph.record_source_path(src)
         self._recipe = recipe.recipe_hash(fn)
+        self._register()
+
+    def _fingerprint_doc(self) -> Dict[str, Any]:
+        doc = super()._fingerprint_doc()
+        doc.update({"recipe": self._recipe})
+        return doc
 
     def job_def(self, graph: Optional[Graph] = None) -> Dict[str, Any]:
         return {
@@ -890,10 +1068,6 @@ class GraphJob(Job):
             "exec_template": "InProcess",
             "view": {},
             "fixed_output": None,
-            # The one JobDef field that actually distinguishes a GraphJob
-            # from a plain InProcess "loader layer" job (core/src/scheduler.rs
-            # module docs) — without this the scheduler calls
-            # `run_in_process` instead of `expand_graph_job`.
             "graph_job": True,
         }
 
@@ -913,40 +1087,18 @@ class UnsandboxedJob(Job):
     def __init__(
         self,
         run: Callable,
-        view: Optional[Union[str, Dict[str, str]]] = None,
+        outputs: Optional[Union[str, Dict[str, str]]] = None,
         inputs: Optional[Dict[str, Any]] = None,
         env: Optional[Dict[str, str]] = None,
         resources: Optional[Resources] = None,
         retain: Any = None,
-        name: Optional[str] = None,
     ):
         graph = _require_current_graph()
-        if isinstance(view, dict):
-            view_map = dict(view)
-        elif isinstance(view, str):
-            view_map = {"out": view}
+        if isinstance(outputs, str):
+            publish = {"out": outputs}
         else:
-            view_map = {}
-        job_id = name
-        if job_id is None and view_map:
-            job_id = _derive_id(view_map, "UnsandboxedJob")
-        if job_id is None:
-            job_id = getattr(run, "__qualname__", None)
-        if job_id is None:
-            raise DefinitionError(
-                "UnsandboxedJob requires name= when it has no view and run has "
-                "no __qualname__"
-            )
-        super().__init__(graph, job_id, view_map)
-        warnings.warn(
-            f"UnsandboxedJob {self.id!r}: runs unsandboxed, forked from the "
-            "coordinator (§6.3 tier 3) — marked sandboxed=false in its "
-            "manifest and still determinism-checked at publish, but it "
-            "inherits ppg2's fork-under-threads hazards. Prefer DataJob "
-            "unless you genuinely need COW-shared in-process state.",
-            UserWarning,
-            stacklevel=2,
-        )
+            publish = _normalize_outputs(outputs, "UnsandboxedJob")
+        super().__init__(graph, publish)
         self.run = run
         src = _callable_source_file(run)
         if src is not None:
@@ -956,6 +1108,31 @@ class UnsandboxedJob(Job):
         self.resources = resources.pools if isinstance(resources, Resources) else {}
         self.retain = retain if retain is not None else Retain.Default
         self._recipe = recipe.recipe_hash(run)
+        self._register()
+        warnings.warn(
+            f"UnsandboxedJob {self.label!r}: runs unsandboxed, forked from "
+            "the coordinator (§6.3 tier 3) — marked sandboxed=false in its "
+            "manifest and still determinism-checked at publish, but it "
+            "inherits ppg2's fork-under-threads hazards. Prefer DataJob "
+            "unless you genuinely need COW-shared in-process state.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    def _fingerprint_doc(self) -> Dict[str, Any]:
+        doc = super()._fingerprint_doc()
+        doc.update(
+            {
+                "recipe": self._recipe,
+                "inputs": {
+                    n: _fingerprint_input(v) for n, v in sorted(self.inputs.items())
+                },
+                "env": dict(sorted(self.env.items())),
+                "resources": dict(sorted(self.resources.items())),
+                "retain": repr(self.retain),
+            }
+        )
+        return doc
 
     def job_def(self, graph: Optional[Graph] = None) -> Dict[str, Any]:
         graph = graph or self.graph
@@ -969,12 +1146,12 @@ class UnsandboxedJob(Job):
             "tools": {},
             "runtime": {"python_env": None, "preload": [], "shim": "0"},
             "env": dict(self.env),
-            "outputs_declared": sorted(self.view.keys()),
+            "outputs_declared": self.output_names(),
             "resources": dict(self.resources),
             "store_target": None,
             "retain": _retain_json(self.retain),
             "exec_template": "InProcess",
-            "view": dict(self.view),
+            "view": dict(self.publish),
             "fixed_output": None,
             "graph_job": False,
         }

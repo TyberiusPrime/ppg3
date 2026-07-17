@@ -52,7 +52,7 @@ destroyed by a run, only (later, deliberately) by garbage collection.
 
 The store is content-addressed, so on its own it's unreadable: a directory of
 hash-named folders. The **view** projects it back into the human-friendly
-paths you declared in each job's `view=` map.
+paths you declared in each job's `outputs=` map.
 
 `outputs/` is a symlink chain:
 

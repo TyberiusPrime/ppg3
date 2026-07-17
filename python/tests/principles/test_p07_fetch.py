@@ -66,7 +66,7 @@ def test_removing_the_pin_refetches_and_repins(tmp_path, capsys):
         f"g = ppg3.new(stores=[ppg3.Store('main', {str(store_dir)!r})], "
         f"default_python=PyEnv.current(), project_dir={str(tmp_path / '.ppg3')!r}, "
         "frozen=False)\n"
-        f"job = ppg3.FetchJob(view='in/data.bin', url={url!r})\n"
+        f"job = ppg3.FetchJob(outputs='in/data.bin', url={url!r})\n"
         "r = ppg3.run(g, project_id='p7')\n"
     )
     script.write_text(script_text)

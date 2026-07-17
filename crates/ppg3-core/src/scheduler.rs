@@ -892,6 +892,13 @@ fn apply_outcome(shared: &Shared, state: &mut State, id: &str, outcome: JobOutco
 /// (non-`graph_job`) and `Argv` jobs alike. Errors here are per-job
 /// failures (a missing `JobSubset` file name, an internal inconsistency),
 /// never a whole-run abort.
+/// Standalone key derivation for a job with no parent-job inputs (leaf
+/// jobs, e.g. a FetchJob): what the TOFU pass uses to pre-register the
+/// pinned key of an entry it just fetched unpinned (PRINCIPLES.md P7.2).
+pub fn derive_key_standalone(job: &JobDef) -> std::result::Result<(Value, String), String> {
+    derive_key(job, &HashMap::new())
+}
+
 fn derive_key(
     job: &JobDef,
     completed: &HashMap<String, CompletedInfo>,
@@ -1052,13 +1059,19 @@ fn resolve_placeholder(
         };
     }
     if let Some(name) = token.strip_prefix("out:") {
-        let rel = job.view.get(name).ok_or_else(|| {
-            Error::JobFailed(format!(
-                "job {:?}: argv references {{out:{name}}} but {name:?} is not a key of job.view",
+        // Entry layout is keyed by output *name*, never by where a view
+        // links it (PRINCIPLES.md P1.4): the same input key must yield the
+        // same bytes at the same relative paths regardless of publish
+        // destination, or renaming a destination manufactures an ik→oh
+        // conflict.
+        if !job.outputs_declared.iter().any(|o| o == name) {
+            return Err(Report::new(Error::JobFailed(format!(
+                "job {:?}: argv references {{out:{name}}} but {name:?} is not \
+                 a declared output",
                 job.id
-            ))
-        })?;
-        return Ok(Some(format!("/ppg/out/{rel}")));
+            ))));
+        }
+        return Ok(Some(format!("/ppg/out/{name}")));
     }
     if let Some(name) = token.strip_prefix("tool:") {
         if !job.tools.contains_key(name) {
@@ -1332,12 +1345,15 @@ mod tests {
     }
 
     #[test]
-    fn lower_token_out_named_uses_view() {
+    fn lower_token_out_named_uses_output_name_not_publish_path() {
+        // PRINCIPLES.md P1.4: entry layout is keyed by output *name*; the
+        // publish destination (job.view) must never shape the bytes.
         let mut job = argv_job("a", BTreeMap::new());
+        job.outputs_declared.push("result".to_string());
         job.view.insert("result".to_string(), "results/x.tsv".to_string());
         assert_eq!(
             lower_token("{out:result}", &job, &HashMap::new()).unwrap(),
-            "/ppg/out/results/x.tsv"
+            "/ppg/out/result"
         );
     }
 

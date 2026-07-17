@@ -625,6 +625,28 @@ impl Store {
         self.publish_step6_resolve_input_symlink(ik, &oh, tentative)
     }
 
+    /// Register an additional memo link `inputs/<ik>` for an existing
+    /// entry. Used by the TOFU pass (PRINCIPLES.md P7.2): an unpinned fetch
+    /// publishes under a one-shot key; once the hash is pinned into the
+    /// source, the *pinned* key must hit the same entry, or the very next
+    /// run re-downloads what it just fetched.
+    pub fn alias_input(&self, ik: &str, oh: &str) -> Result<(), Error> {
+        self.ensure_writable()?;
+        if !self.entry_dir(oh).is_dir() {
+            return Err(Error::Other(format!(
+                "alias_input: no such entry {oh} in store {:?}",
+                self.name()
+            )));
+        }
+        let _lock = self.publish_step4_lock_shared()?;
+        self.publish_step6_resolve_input_symlink(
+            ik,
+            oh,
+            PublishOutcome::DedupHit { oh: oh.to_string() },
+        )
+        .map(|_| ())
+    }
+
     fn diff_report(&self, old_oh: &str, new_oh: &str) -> Result<String, Error> {
         let old_m = read_manifest(&self.entry_dir(old_oh).join(MANIFEST_FILE))?;
         let new_m = read_manifest(&self.entry_dir(new_oh).join(MANIFEST_FILE))?;
@@ -648,7 +670,8 @@ impl Store {
                         None
                     };
                     let mut line = format!(
-                        "{path}: size {}->{}, blake3 {}->{}, mode {}->{}",
+                        "{}: size {}->{}, blake3 {}->{}, mode {}->{}",
+                        self.data_dir(new_oh).join(path).display(),
                         old_entry.size,
                         new_entry.size,
                         old_entry.blake3,
@@ -673,10 +696,16 @@ impl Store {
         removed.sort();
         changed.sort();
 
+        // A violation report is a set of directions (PRINCIPLES.md P5.2/P9):
+        // every hash it mentions rides with the on-disk path it lives at,
+        // and it ends with the command that continues the investigation.
         let mut out = format!(
-            "determinism violation: input key {ik} previously produced output hash {old_oh}, \
-             this build produced {new_oh}\n",
-            ik = new_m.input_key,
+            "the same inputs (memo link {memo}) produced two different outputs:\n\
+             previous entry: {old_dir}\n\
+             this build:     {new_dir}\n",
+            memo = self.inputs_dir().join(&new_m.input_key).display(),
+            old_dir = self.entry_dir(old_oh).display(),
+            new_dir = self.entry_dir(new_oh).display(),
         );
         out += &format!("added files ({}): {added:?}\n", added.len());
         out += &format!("removed files ({}): {removed:?}\n", removed.len());
@@ -684,6 +713,10 @@ impl Store {
         for c in &changed {
             out += &format!("  {c}\n");
         }
+        out += &format!(
+            "inspect with: ppg3 diff-entries --store {} {old_oh} {new_oh}\n",
+            self.root().display()
+        );
         Ok(out)
     }
 

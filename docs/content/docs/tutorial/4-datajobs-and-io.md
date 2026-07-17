@@ -22,7 +22,7 @@ def build_table(io):
 table = ppg3.DataJob("table.pickle", build_table)
 ```
 
-Note the `view=` here is a single **string** (`"table.pickle"`), not a dict —
+Note the `outputs=` here is a single **string** (`"table.pickle"`), not a dict —
 a `DataJob` always has exactly one output, so you just name where it lands in
 `outputs/`.
 
@@ -35,7 +35,7 @@ def summarize(io):
         fh.write(f"{data['label']}: {sum(data['rows'])}")
 
 ppg3.FileJob(
-    view={"summary": "summary.txt"},
+    outputs={"summary": "summary.txt"},
     run=summarize,
     inputs={"table": table},
 )
@@ -96,7 +96,7 @@ samtools = ToolSpec.nix(
 )
 
 ppg3.CommandJob(
-    view={"sorted": "sorted.bam"},
+    outputs={"sorted": "sorted.bam"},
     argv=["{tool:samtools}", "sort", "{in:reads}", "-o", "{out:sorted}"],
     tools=[samtools],
     inputs={"reads": some_bam_job},

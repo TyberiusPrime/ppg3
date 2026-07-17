@@ -73,10 +73,13 @@ def test_violation_report_names_the_artifacts(tmp_path):
 @principle("P9.4")
 def test_no_bare_hash_without_an_accompanying_path(tmp_path):
     msg = _violation_message(tmp_path)
+    # Rejoin word-wrap continuations (indented to the value column): the
+    # invariant governs logical statements, not the renderer's line width.
+    logical = re.sub(r"\n {8,}", " ", msg)
     hex64 = re.compile(r"\b[0-9a-f]{64}\b")
     bare = [
         line
-        for line in msg.splitlines()
+        for line in logical.splitlines()
         if hex64.search(line) and "/" not in line and "://" not in line
     ]
     assert bare == [], (

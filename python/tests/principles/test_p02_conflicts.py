@@ -38,19 +38,16 @@ def test_contested_destination_error_names_both_call_sites(tmp_path):
 def test_contested_destination_cannot_be_smuggled_past_the_check(tmp_path):
     # The first pass's name= kwarg "disambiguated" duplicate ids — which
     # let two *different* jobs publish the same path with no error at all.
-    # However jobs are spelled, one destination + two different jobs must
-    # error.
+    # However jobs differ — here only in a declared env var, the subtlest
+    # difference that still changes the input key — one destination + two
+    # different jobs must error.
     new_graph(tmp_path)
-    command_job(
-        {"out": "same.txt"},
-        argv=["/bin/sh", "-c", "echo a > {out:out}"],
-        name="first",
-    )
+    command_job({"out": "same.txt"}, argv=["/bin/sh", "-c", "echo a > {out:out}"])
     with pytest.raises(Exception):
         command_job(
             {"out": "same.txt"},
-            argv=["/bin/sh", "-c", "echo b > {out:out}"],
-            name="second",
+            argv=["/bin/sh", "-c", "echo a > {out:out}"],
+            env={"SUBTLE": "difference"},
         )
 
 

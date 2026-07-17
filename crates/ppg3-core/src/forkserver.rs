@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -147,14 +147,9 @@ pub(crate) fn template_key_for(job: &PreparedJob) -> Option<TemplateKey> {
 }
 
 // ================================================================= misc
-
-static WARN_ONCE: Once = Once::new();
-
-fn warn_once() {
-    WARN_ONCE.call_once(|| {
-        eprintln!("forkserver: sandbox=none children (no enforcement)");
-    });
-}
+//
+// (The old "forkserver: sandbox=none children" warning moved to the run
+// entry points — PRINCIPLES.md P6.5 wants exactly one warning per run.)
 
 /// Last `n` lines of `bytes` as a lossy UTF-8 string — used to inline a
 /// dead template's stderr tail into the dispatch error.
@@ -631,28 +626,34 @@ impl Drop for TemplateManager {
 /// Dropping a `ForkserverExecutor` does **not** kill any templates — only
 /// dropping (or explicitly shutting down) the underlying `TemplateManager`
 /// does; see the module doc "Ownership split".
-pub struct ForkserverExecutor {
+pub struct ForkserverExecutor<F: Executor = NoneExecutor> {
     manager: Arc<TemplateManager>,
-    fallback: NoneExecutor,
+    fallback: F,
 }
 
-impl ForkserverExecutor {
-    pub fn new(manager: Arc<TemplateManager>, fallback: NoneExecutor) -> Self {
+impl<F: Executor> ForkserverExecutor<F> {
+    pub fn new(manager: Arc<TemplateManager>, fallback: F) -> Self {
         ForkserverExecutor { manager, fallback }
     }
 }
 
-impl Executor for ForkserverExecutor {
+impl<F: Executor> Executor for ForkserverExecutor<F> {
     fn run(&self, job: &PreparedJob) -> std::result::Result<ExecResult, Report<Error>> {
         if !self.manager.is_enabled() || !is_shim_job(job) {
             return self.fallback.run(job);
         }
-        warn_once();
         self.manager.run_via_template(job)
     }
 
     fn is_sandboxed(&self) -> bool {
-        false
+        // Template children run unenforced today, so template dispatch can
+        // never claim `sandboxed: true`; with templates disabled every job
+        // takes the fallback, whose enforcement is what actually applied.
+        if self.manager.is_enabled() {
+            false
+        } else {
+            self.fallback.is_sandboxed()
+        }
     }
 }
 

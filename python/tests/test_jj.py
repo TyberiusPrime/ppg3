@@ -210,17 +210,17 @@ def test_graph_records_job_source_paths(tmp_path):
     this_file = os.path.abspath(__file__)
 
     # Constructor call site (this file), even for a callback-less job kind.
-    ppg3.CommandJob(
-        view={"greeting": "greeting.txt"},
+    greeting = ppg3.CommandJob(
+        outputs={"greeting": "greeting.txt"},
         argv=["/bin/sh", "-c", "echo hi > {out:greeting}"],
     )
     assert this_file in g.source_paths()
 
     # Callable callbacks record their defining file (here: also this file).
     ppg3.FileJob(
-        view={"summary": "summary.txt"},
+        outputs={"summary": "summary.txt"},
         run=_summary_callback,
-        inputs={"greeting": g.jobs["greeting.txt"]},
+        inputs={"greeting": greeting},
     )
     assert g.source_paths().count(this_file) == 1  # deduplicated
 
@@ -230,7 +230,7 @@ def test_graph_records_job_source_paths(tmp_path):
     inc_file = tmp_path / "helpers.py"
     inc_file.write_text("# helpers\n")
     ppg3.FileJob(
-        view={"extra": "extra.txt"},
+        outputs={"extra": "extra.txt"},
         run=ppg3.Source(f"{src_file}::cb", includes=[str(inc_file)]),
     )
     sources = g.source_paths()
@@ -241,7 +241,7 @@ def test_graph_records_job_source_paths(tmp_path):
     data = tmp_path / "data.csv"
     data.write_text("1,2\n")
     ppg3.CommandJob(
-        view={"copy": "copy.csv"},
+        outputs={"copy": "copy.csv"},
         argv=["/bin/cp", ppg3.In("d"), ppg3.Out("copy")],
         inputs={"d": ppg3.File(str(data))},
     )
@@ -269,7 +269,7 @@ def _make_jj_graph(tmp_path):
         jj=True,
     )
     ppg3.CommandJob(
-        view={"greeting": "greeting.txt"},
+        outputs={"greeting": "greeting.txt"},
         argv=["/bin/sh", "-c", "echo hello > {out:greeting}"],
     )
     return g
@@ -336,7 +336,7 @@ def test_run_without_jj_flag_still_writes_vcs_less_meta(tmp_path):
         paranoid=True,
     )
     ppg3.CommandJob(
-        view={"greeting": "greeting.txt"},
+        outputs={"greeting": "greeting.txt"},
         argv=["/bin/sh", "-c", "echo hello > {out:greeting}"],
     )
     r = ppg3.run(g, project_id="no-jj")

@@ -85,7 +85,18 @@ def run_tofu_pass(graph: Graph, report: Dict[str, Any], core: Any, handle: Any) 
             f"manifest content, got {sorted(content.keys())!r}"
         )
         _rel_path, file_entry = items[0]
-        resolved.append((job, file_entry["blake3"]))
+        digest = file_entry["blake3"]
+        resolved.append((job, digest))
+        # PRINCIPLES.md P7.2: the unpinned fetch ran under a one-shot key
+        # (unpinned = "trust the next download", never a memo hit). Alias
+        # the *pinned* key onto the entry it just produced, so the run after
+        # the patch (or after the user pins by hand from the table) hits
+        # instead of re-downloading what we just fetched and verified.
+        try:
+            pinned_ik = core.derive_input_key(json.dumps(job.pinned_job_def(digest)))
+            core.alias_input_key(handle, ik, pinned_ik)
+        except Exception as e:  # post-run reporting must not fail the run
+            sys.stderr.write(f"ppg3 tofu: could not alias pinned key: {e}\n")
 
     if not resolved:
         return
@@ -265,7 +276,7 @@ def _patch_file(file: str, site_entries: List[Tuple[int, "FetchJob", str]]) -> L
             end_off = offset(vpos.end)
             edits.append((end_off, end_off, f", blake3={quoted}"))
 
-        view_path = job.view[FetchJob.OUTPUT_NAME]
+        view_path = job.publish.get(FetchJob.OUTPUT_NAME, job.url)
         patched_msgs.append((view_path, lineno, digest))
 
     if edits:
@@ -292,5 +303,5 @@ def _print_table(table_rows: List[_TableRow]) -> None:
         "structure, their job):"
     )
     for job, digest in table_rows:
-        view_path = job.view[FetchJob.OUTPUT_NAME]
-        print(f"  {job.url}\t{digest}\t(view={view_path})")
+        view_path = job.publish.get(FetchJob.OUTPUT_NAME, job.url)
+        print(f"  {job.url}\t{digest}\t(outputs={view_path})")

@@ -67,33 +67,67 @@ def _fmt_duration(ms: Optional[int]) -> str:
     return f"{m}m{rem}s"
 
 
+def _job_meta_from_graph(graph) -> Dict[str, Dict[str, str]]:
+    """id -> {"label", "kind", "defsite"} for report translation: internal
+    ids never reach the user (PRINCIPLES.md P1.5) — every job is shown by
+    its published destinations (or definition site for internal jobs)."""
+    meta: Dict[str, Dict[str, str]] = {}
+    seen_labels: Dict[str, int] = {}
+    for jid, job in graph.jobs.items():
+        label = getattr(job, "label", jid)
+        # Labels can collide (e.g. two internal jobs defined on one line in
+        # a loop); disambiguate so translated dicts never silently merge.
+        n = seen_labels.get(label, 0)
+        seen_labels[label] = n + 1
+        if n:
+            label = f"{label}#{n + 1}"
+        meta[jid] = {
+            "label": label,
+            "kind": getattr(job, "kind", ""),
+            "defsite": getattr(job, "defsite", ""),
+        }
+    return meta
+
+
 class RunResult:
-    """The outcome of a :func:`run` call. ``.raw`` is the full decoded
-    ``RunReport`` JSON (CONTRACT.md's ``built``/``hits``/``failed``/
-    ``job_entries``) for anything not surfaced as a dedicated attribute."""
+    """The outcome of a :func:`run` call. ``built``/``hits``/``failed`` are
+    keyed by job *label* (published destinations, or `<kind @ file:line>`
+    for internal jobs) — never by internal ids (P1.5). ``.raw`` is the full
+    decoded ``RunReport`` JSON, untranslated."""
 
     def __init__(
         self,
         report: Dict[str, Any],
         generation: Optional[int] = None,
-        job_kinds: Optional[Dict[str, str]] = None,
+        job_meta: Optional[Dict[str, Dict[str, str]]] = None,
+        partial_dir: Optional[str] = None,
     ):
-        self.built: List[str] = list(report.get("built", []))
-        self.hits: List[str] = list(report.get("hits", []))
-        self.failed: Dict[str, str] = dict(report.get("failed", {}))
-        # id -> {"reason", "log_dir", "failure_log", "exit_code", "out_dir",
-        # "runtime_ms"} (see the Rust `FailedJob`); one entry per `failed`
-        # key. Empty dict from an older core that predates the field.
-        self.failed_details: Dict[str, Dict[str, Any]] = dict(
-            report.get("failed_details", {})
-        )
-        # id -> job kind ("command"/"file"/"data"/...), so the failure report
-        # can show an exit code only for CommandJobs (a FileJob's exit code is
-        # always 1 and meaningless — its traceback is what matters). Empty
-        # when the graph is unavailable (e.g. constructed straight from raw).
-        self.job_kinds: Dict[str, str] = dict(job_kinds or {})
-        self.job_entries: Dict[str, Any] = dict(report.get("job_entries", {}))
+        self.job_meta: Dict[str, Dict[str, str]] = dict(job_meta or {})
+
+        def _label(jid: str) -> str:
+            return self.job_meta.get(jid, {}).get("label", jid)
+
+        self.built: List[str] = sorted(_label(j) for j in report.get("built", []))
+        self.hits: List[str] = sorted(_label(j) for j in report.get("hits", []))
+        self.failed: Dict[str, str] = {
+            _label(j): reason for j, reason in report.get("failed", {}).items()
+        }
+        # label -> {"reason", "log_dir", "failure_log", "exit_code",
+        # "out_dir", "runtime_ms", "kind", "defsite"} (see the Rust
+        # `FailedJob`, enriched with graph metadata).
+        self.failed_details: Dict[str, Dict[str, Any]] = {}
+        for jid, detail in dict(report.get("failed_details", {})).items():
+            enriched = dict(detail)
+            enriched["kind"] = self.job_meta.get(jid, {}).get("kind", "")
+            enriched["defsite"] = self.job_meta.get(jid, {}).get("defsite", "")
+            self.failed_details[_label(jid)] = enriched
+        self.job_entries: Dict[str, Any] = {
+            _label(j): v for j, v in dict(report.get("job_entries", {})).items()
+        }
         self.generation = generation
+        # P8.2: where the partial tree of finished outputs lives after a
+        # failed run (None on success or when nothing finished).
+        self.partial_dir = partial_dir
         self.raw = report
 
     def __repr__(self) -> str:
@@ -108,15 +142,23 @@ class RunResult:
     _WRAP = 80
 
     def format_failures(self) -> str:
-        """Human-readable, per-job failure report. One block per failed job
-        (blank line between blocks): ``Job`` / ``Runtime`` / ``Exit`` (only
-        for CommandJobs) / ``Exception`` (wrapped) / ``Log`` / ``Outputs``.
-        Plain text, no third-party deps — what :class:`PPGRunError` renders."""
+        """Human-readable, per-job failure report (PRINCIPLES.md P9: every
+        failure names its artifacts). One block per failed job: ``Job`` /
+        ``Defined`` / ``Runtime`` / ``Exit`` (only for CommandJobs) /
+        ``Exception`` (wrapped) / ``Log`` / ``Outputs`` / ``Kept``. Plain
+        text, no third-party deps — what :class:`PPGRunError` renders."""
         names = sorted(self.failed)
         if not names:
             return "no failed jobs"
         blocks = [self._format_one_failure(name) for name in names]
-        return f"{len(names)} job(s) failed:\n\n" + "\n\n".join(blocks)
+        text = f"{len(names)} job(s) failed:\n\n" + "\n\n".join(blocks)
+        if self.partial_dir:
+            text += (
+                f"\n\nPartial results: {self.partial_dir}\n"
+                "(every job that finished before the failure, browsable; "
+                "the current generation is untouched)"
+            )
+        return text
 
     def _format_one_failure(self, name: str) -> str:
         detail = self.failed_details.get(name, {})
@@ -127,6 +169,12 @@ class RunResult:
 
         field("Job", name)
 
+        # P9.1/P1.5: where the failing job was defined — the line the user
+        # opens first.
+        defsite = detail.get("defsite")
+        if defsite:
+            field("Defined", defsite)
+
         runtime_ms = detail.get("runtime_ms")
         if runtime_ms is not None:
             field("Runtime", _fmt_duration(runtime_ms))
@@ -134,13 +182,24 @@ class RunResult:
         # Exit code only for CommandJobs — a FileJob's is always 1 and its
         # traceback (Exception, below) is the real story.
         exit_code = detail.get("exit_code")
-        if exit_code is not None and self.job_kinds.get(name) == "command":
+        if exit_code is not None and detail.get("kind") == "command":
             field("Exit", str(exit_code))
 
         reason = detail.get("reason") or self.failed.get(name, "")
         exc = _last_meaningful_line(reason)
         if exc:
             self._wrapped_field(lines, "Exception", exc)
+
+        # P9.2/P9.3: the job's own words are the evidence — inline the
+        # stderr tail (which for e.g. a fetch mismatch carries the url,
+        # both hashes, and the retained-download path) instead of reducing
+        # it to one line.
+        if "--- stderr tail ---" in reason:
+            tail = reason.split("--- stderr tail ---", 1)[1].strip().splitlines()
+            if len(tail) > 1:  # a single line is already the Exception above
+                lines.append("Stderr:")
+                for tl in tail[:15]:
+                    lines.append(" " * (self._LABEL_W + 1) + tl.rstrip())
 
         log = detail.get("failure_log") or detail.get("log_dir")
         if log:
@@ -149,8 +208,25 @@ class RunResult:
         out_dir = detail.get("out_dir")
         if out_dir:
             field("Outputs", out_dir)
+            # P9.3/P7.4: whatever the failed job left behind (e.g. a
+            # rejected download kept for inspection) — list it, don't make
+            # the user go digging.
+            for kept in self._kept_files(out_dir):
+                field("Kept", kept)
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _kept_files(out_dir: str, limit: int = 5) -> List[str]:
+        import os
+
+        found: List[str] = []
+        for root, _dirs, files in os.walk(out_dir):
+            for fname in sorted(files):
+                found.append(os.path.join(root, fname))
+                if len(found) >= limit:
+                    return found
+        return found
 
     def _wrapped_field(self, lines: List[str], label: str, text: str) -> None:
         """Append a label/value field whose value is word-wrapped to
@@ -266,6 +342,49 @@ class RunCallbacks:
         job.run(job_io)
         self._inprocess_memo[job_id] = None
         _loader_memo[ik] = None
+
+
+def _write_partial_tree(graph, report, core, handle, partial_dir: str) -> bool:
+    """PRINCIPLES.md P8.2: after a failed run, link every *finished* job's
+    published outputs into ``<project_dir>/partial/`` so a user two days
+    into a multi-day run can inspect results without store archaeology. The
+    tree is rebuilt from scratch on every failed run and removed on the
+    next success; `current` (P8.3) is never touched. Returns whether any
+    output was linked."""
+    import shutil
+
+    shutil.rmtree(partial_dir, ignore_errors=True)
+    failed = set(report.get("failed", {}))
+    entries = report.get("job_entries", {})
+    made = False
+    for jid, job in graph.jobs.items():
+        if jid in failed or not getattr(job, "publish", None):
+            continue
+        entry = entries.get(jid)
+        if entry is None:
+            continue
+        ik, _oh = entry
+        looked = core.lookup(handle, ik)
+        if looked is None:
+            continue
+        info = json.loads(looked)
+        store = graph.stores[info["store_index"]]
+        data_dir = os.path.join(
+            os.path.abspath(store.path), "v1", "entries", info["output_hash"], "data"
+        )
+        for output_name, dest in job.publish.items():
+            src = os.path.join(data_dir, output_name)
+            if not os.path.exists(src):
+                continue
+            target = os.path.join(partial_dir, dest)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if os.path.lexists(target):
+                os.remove(target)
+            os.symlink(src, target)
+            made = True
+    if not made:
+        shutil.rmtree(partial_dir, ignore_errors=True)
+    return made
 
 
 def _write_project_config(graph: Graph) -> None:
@@ -435,6 +554,16 @@ def run(
         _jj.assert_sources_tracked(jj_root, graph.source_paths())
         vcs_json = json.dumps(_jj.capture_state(jj_root))
 
+    # PRINCIPLES.md P3.1: a missing writable store is a *configuration*
+    # error — one message, before any job is dispatched, never the same
+    # failure repeated per job.
+    if not any(not s.readonly for s in graph.stores):
+        raise RuntimeError(
+            "no writable store configured — ppg3.new(stores=[...]) needs at "
+            "least one writable ppg3.Store(...); every job's outputs are "
+            "content in a store (PRINCIPLES.md P3)"
+        )
+
     _write_project_config(graph)
     work_dir = os.path.join(graph.project_dir, "work")
     os.makedirs(work_dir, exist_ok=True)
@@ -460,14 +589,20 @@ def run(
     # `graph.forkserver=False` disables this entirely: an empty list here
     # makes the Rust side skip template dispatch unconditionally for every
     # job, falling back to the pre-forkserver behavior.
+    # PRINCIPLES.md P6: when real enforcement is available and wanted,
+    # disable the forkserver templates — template children run unenforced,
+    # so every job must take the (sandboxed) fallback executor instead.
+    use_forkserver = graph.forkserver
+    if graph.sandbox != "off" and core.sandbox_available():
+        use_forkserver = False
     template_argv = (
-        [sys.executable, "-I", "-m", "ppg3._template"] if graph.forkserver else []
+        [sys.executable, "-I", "-m", "ppg3._template"] if use_forkserver else []
     )
     # §6.7: with the forkserver on, dispatch through the module-level
     # session so templates stay warm across run() calls in this process
     # (watch iterations, repl). run(session=...) makes the Rust side use
     # the session's TemplateManager instead of a run-scoped one.
-    session = _get_session(core) if graph.forkserver else None
+    session = _get_session(core) if use_forkserver else None
     report_json = core.run(
         handle,
         jobs_json,
@@ -476,6 +611,7 @@ def run(
         work_dir,
         template_argv,
         session,
+        graph.sandbox,
     )
     report = json.loads(report_json)
 
@@ -488,10 +624,27 @@ def run(
     _last_run_info["watched_paths"] = graph.watched_paths()
     _last_run_info["report"] = report
 
-    job_kinds = {jid: getattr(j, "kind", None) for jid, j in graph.jobs.items()}
+    job_meta = _job_meta_from_graph(graph)
+    partial_dir = os.path.join(graph.project_dir, "partial")
 
     if report.get("failed"):
-        raise PPGRunError(RunResult(report, generation=None, job_kinds=job_kinds))
+        # P8.2: finished work is never withheld — link every completed
+        # job's outputs into a browsable partial tree (marked by its name
+        # and location; never `current`, see P8.3) and say where it is.
+        made = _write_partial_tree(graph, report, core, handle, partial_dir)
+        raise PPGRunError(
+            RunResult(
+                report,
+                generation=None,
+                job_meta=job_meta,
+                partial_dir=partial_dir if made else None,
+            )
+        )
+    # A stale partial tree from an earlier failed run would misrepresent
+    # this (successful) state — drop it.
+    import shutil as _shutil
+
+    _shutil.rmtree(partial_dir, ignore_errors=True)
 
     # §7.6 TOFU: after a successful run, patch (or table-print) the real
     # hash for every FetchJob defined with blake3=None. Purely a
@@ -507,7 +660,7 @@ def run(
     job_entries = report.get("job_entries", {})
     view_entries = []
     for job_id, job in graph.jobs.items():
-        if not job.view:
+        if not job.publish:
             continue
         entry = job_entries.get(job_id)
         if entry is None:
@@ -516,21 +669,21 @@ def run(
         looked = core.lookup(handle, ik)
         if looked is None:
             raise RuntimeError(
-                f"internal error: job {job_id!r} reported input key {ik!r} in "
-                "its run report but a post-run lookup() found no manifest for it"
+                f"internal error: job {job.label!r} reported input key {ik!r} "
+                "in its run report but a post-run lookup() found no manifest "
+                "for it"
             )
         info = json.loads(looked)
         store_index = info["store_index"]
-        for _output_name, view_path in job.view.items():
-            # The job actually wrote to `/ppg/out/<view_path>` (scheduler.rs
-            # `resolve_placeholder`'s `{out:NAME}` case resolves NAME via
-            # `job.view`), so `view_path` is *also* the file's relative path
-            # within the entry's `data/` — i.e. a content-manifest key.
+        for output_name, view_path in job.publish.items():
+            # Entry layout is keyed by output *name* (PRINCIPLES.md P1.4 —
+            # the job wrote `/ppg/out/<output_name>`); the publish path is
+            # pure pointer state, resolved right here and nowhere deeper.
             view_entries.append(
                 {
                     "view_rel_path": view_path,
                     "oh": oh,
-                    "path_within_entry": view_path,
+                    "path_within_entry": output_name,
                     "store_index": store_index,
                 }
             )
@@ -559,4 +712,4 @@ def run(
         vcs_json,
     )
     _last_run_info["generation"] = generation
-    return RunResult(report, generation=generation, job_kinds=job_kinds)
+    return RunResult(report, generation=generation, job_meta=job_meta)

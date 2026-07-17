@@ -193,7 +193,7 @@ def test_watched_paths_records_file_leaf_input_at_lowering(tmp_path):
     leaf.write_text("hi")
     g = ppg3.new(stores=[], project_dir=str(tmp_path / ".ppg3"), frozen=False)
     ppg3.CommandJob(
-        view={"out": "out.txt"},
+        outputs={"out": "out.txt"},
         argv=["/bin/true"],
         inputs={"leaf": ppg3.File(str(leaf))},
     )
@@ -221,7 +221,7 @@ def test_watched_paths_records_source_file_and_includes_at_definition(tmp_path):
     # Recorded at __init__ time (definition), *before* job_defs() is ever
     # called — unlike the File-leaf case above.
     ppg3.FileJob(
-        view={"out": "out.bin"},
+        outputs={"out": "out.bin"},
         run=ppg3.Source(f"{cb_file}::cb", includes=[str(include_file)]),
     )
     assert set(g.watched_paths()) == {str(cb_file), str(include_file)}
@@ -233,12 +233,12 @@ def test_watched_paths_deduplicates_and_sorts(tmp_path):
     leaf.write_text("hi")
     g = ppg3.new(stores=[], project_dir=str(tmp_path / ".ppg3"), frozen=False)
     ppg3.CommandJob(
-        view={"a": "a.txt"},
+        outputs={"a": "a.txt"},
         argv=["/bin/true"],
         inputs={"leaf": ppg3.File(str(leaf))},
     )
     ppg3.CommandJob(
-        view={"b": "b.txt"},
+        outputs={"b": "b.txt"},
         argv=["/bin/true"],
         inputs={"leaf": ppg3.File(str(leaf))},
     )
@@ -265,7 +265,7 @@ def test_two_definition_passes_do_not_accumulate_jobs(tmp_path):
     script.write_text(
         "import ppg3\n"
         f"g = ppg3.new(stores=[], project_dir={str(tmp_path / '.ppg3')!r}, frozen=False)\n"
-        "ppg3.CommandJob(view={'out': 'out.txt'}, argv=['/bin/true'])\n"
+        "ppg3.CommandJob(outputs={'out': 'out.txt'}, argv=['/bin/true'])\n"
     )
 
     _run_definition_pass(str(script), [])
@@ -383,7 +383,7 @@ def _write_pipeline_script(path):
         "    paranoid=True,\n"
         ")\n"
         "ppg3.CommandJob(\n"
-        "    view={'out': 'out.txt'},\n"
+        "    outputs={'out': 'out.txt'},\n"
         "    argv=['/bin/sh', '-c', cat_bin + ' ' + leaf_path + ' > {out:out}'],\n"
         "    inputs={'leaf': ppg3.File(leaf_path)},\n"
         ")\n"

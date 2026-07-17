@@ -31,11 +31,17 @@ def test_sandbox_mode_is_selectable_at_graph_creation():
 @requires_core
 @principle("P6.2")
 def test_sandbox_require_fails_at_run_start_when_unavailable(tmp_path):
-    # Intent: ppg3.new(sandbox="require") on a host without namespace
-    # support (or with the extension built without enforcement) errors at
-    # run start with instructions — never a silent downgrade. Needs P6.1's
-    # knob to exist before it can be asserted.
-    pytest.fail("needs ppg3.new(sandbox=...) wiring (P6.1) first")
+    from ppg3 import _core
+
+    if _core.sandbox_available():
+        pytest.skip("host has real enforcement — the unavailable path can't fire")
+    g = new_graph(tmp_path, sandbox="require")
+    command_job({"out": "a.txt"}, argv=["/bin/sh", "-c", "echo a > {out:out}"])
+    with pytest.raises(Exception) as ei:
+        run_graph(g)
+    msg = str(ei.value).lower()
+    # Never a silent downgrade: an error, at run start, with instructions.
+    assert "sandbox" in msg and ("bwrap" in msg or "nix" in msg)
 
 
 @requires_core

@@ -37,7 +37,7 @@ def _fresh_graph(tmp_path, tag, n):
         paranoid=True,
     )
     ppg3.FileJob(
-        view={"out": "out.txt"},
+        outputs={"out": "out.txt"},
         run=_write_ppid,
         inputs={"cfg": ppg3.Params({"n": n})},
     )
@@ -117,7 +117,6 @@ def test_loader_memo_persists_across_runs_until_session_stop(tmp_path):
         with pytest.warns(UserWarning):
             ppg3.UnsandboxedJob(
                 run=_counting_loader,
-                name="loader",
                 inputs={"cfg": ppg3.Params({"n": 1})},
             )
         r = ppg3.run(g, project_id="loader-memo")

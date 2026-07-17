@@ -24,6 +24,7 @@ from .jobs import (
     UnsandboxedJob,
     new,
 )
+from .generations import verify_generation
 from .jj import JJError
 from .localscope import DefinitionError
 from .run import run, session_stop

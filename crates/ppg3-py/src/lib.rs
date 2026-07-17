@@ -68,7 +68,7 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use ppg3_core::executor::NoneExecutor;
+use ppg3_core::executor::{self, BwrapExecutor, Executor, NoneExecutor};
 use ppg3_core::forkserver::{ForkserverExecutor, TemplateManager};
 use ppg3_core::manifest::Manifest;
 use ppg3_core::scheduler::{self, HostCallbacks, JobDef};
@@ -140,6 +140,33 @@ struct LookupResult<'a> {
     store_index: usize,
     #[serde(flatten)]
     manifest: &'a Manifest,
+}
+
+/// Register an additional memo link for the entry `ik_src` resolves to,
+/// in the store where it was found (PRINCIPLES.md P7.2 — the TOFU pass
+/// aliases the pinned key onto the entry the unpinned fetch produced).
+/// Returns `False` when `ik_src` has no entry.
+#[pyfunction]
+fn alias_input_key(handle: &StoreSetHandle, ik_src: &str, ik_dst: &str) -> PyResult<bool> {
+    match handle.inner.lookup(ik_src).map_err(to_pyerr)? {
+        Some((store_index, manifest)) => {
+            handle.inner.stores[store_index]
+                .alias_input(ik_dst, &manifest.output_hash)
+                .map_err(to_pyerr)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Input key of a leaf job (no parent-job inputs) straight from its JobDef
+/// JSON — the exact `derive_key` the scheduler runs, so the Python side
+/// never re-implements the key-document shape.
+#[pyfunction]
+fn derive_input_key(job_def_json: &str) -> PyResult<String> {
+    let job: JobDef = serde_json::from_str(job_def_json).map_err(to_pyerr)?;
+    let (_doc, ik) = scheduler::derive_key_standalone(&job).map_err(to_pyerr)?;
+    Ok(ik)
 }
 
 #[pyfunction]
@@ -265,9 +292,23 @@ impl HostCallbacks for PyHostCallbacks {
 // through `run.py`'s call site and CONTRACT.md's PyO3 boundary sketch for no
 // real clarity gain at this arity — every argument here is a plain JSON
 // str/bool/Vec/handle, not several booleans that are easy to transpose.
+/// True when real enforcement is possible on this host: `bwrap` can create
+/// its namespaces *and* `nix-store` exists (the hermetic sandbox mounts nix
+/// closures; without nix there is nothing hermetic to mount).
+#[pyfunction]
+fn sandbox_available() -> bool {
+    executor::bwrap_runtime_available() && binary_on_path("nix-store")
+}
+
+fn binary_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (handle, jobs_json, parallelism_json, callbacks, work_dir, template_argv = Vec::new(), session = None))]
+#[pyo3(signature = (handle, jobs_json, parallelism_json, callbacks, work_dir, template_argv = Vec::new(), session = None, sandbox = String::new()))]
 fn run(
     py: Python<'_>,
     handle: &StoreSetHandle,
@@ -277,11 +318,47 @@ fn run(
     work_dir: &str,
     template_argv: Vec<String>,
     session: Option<PyRef<'_, Session>>,
+    sandbox: String,
 ) -> PyResult<String> {
     let jobs: Vec<JobDef> = serde_json::from_str(jobs_json).map_err(to_pyerr)?;
     let parallelism: BTreeMap<String, u64> =
         serde_json::from_str(parallelism_json).map_err(to_pyerr)?;
-    let fallback = NoneExecutor::new(PathBuf::from(work_dir));
+    // Additive 9th argument (PRINCIPLES.md P6): sandbox mode. Empty string
+    // (older callers) means "auto".
+    let sandbox = if sandbox.is_empty() { "auto" } else { sandbox.as_str() };
+    let enforce = match sandbox {
+        "off" => false,
+        "auto" => sandbox_available(),
+        "require" => {
+            if !sandbox_available() {
+                return Err(PyRuntimeError::new_err(
+                    "sandbox=\"require\": no enforcement available on this host — \
+                     it needs `bwrap` with working unprivileged user namespaces \
+                     AND a nix installation (`nix-store` on PATH). Install both, \
+                     or drop to sandbox=\"auto\" / \"off\".",
+                ));
+            }
+            true
+        }
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "invalid sandbox mode {other:?}: expected \"require\", \"auto\", or \"off\""
+            )))
+        }
+    };
+    if !enforce && sandbox != "off" {
+        // Exactly one warning per run (P6.5) — executors themselves are
+        // deliberately silent about this.
+        eprintln!(
+            "ppg3: running WITHOUT sandbox enforcement (bwrap/nix unavailable); \
+             undeclared inputs are not isolated"
+        );
+    }
+    let fallback: Box<dyn Executor> = if enforce {
+        Box::new(BwrapExecutor::new("bwrap"))
+    } else {
+        Box::new(NoneExecutor::new(PathBuf::from(work_dir)))
+    };
     // Additive 6th argument (forkserver work package, see STATUS.md):
     // `template_argv` — empty (the default, and what `run.py` passes when
     // the caller opts out via `forkserver=False`) disables the forkserver
@@ -393,6 +470,9 @@ fn ppg3_core_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(blake3_hex, m)?)?;
     m.add_function(wrap_pyfunction!(open_stores, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
+    m.add_function(wrap_pyfunction!(alias_input_key, m)?)?;
+    m.add_function(wrap_pyfunction!(derive_input_key, m)?)?;
+    m.add_function(wrap_pyfunction!(sandbox_available, m)?)?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(write_generation, m)?)?;
     m.add_function(wrap_pyfunction!(open_session, m)?)?;

@@ -32,7 +32,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use error_stack::{Report, ResultExt as _};
@@ -110,15 +109,25 @@ fn ppg_name(virtual_path: &str) -> Result<&str> {
         .ok_or_else(|| Report::new(Error::Other(format!("malformed virtual mount path: {virtual_path:?}"))))
 }
 
-// ============================================================ NoneExecutor
+// Trait objects are executors too — lets a caller pick the fallback
+// (NoneExecutor vs BwrapExecutor) at runtime and hand it to the generic
+// `ForkserverExecutor<F>`.
+impl Executor for Box<dyn Executor> {
+    fn run(&self, job: &PreparedJob) -> std::result::Result<ExecResult, Report<Error>> {
+        (**self).run(job)
+    }
 
-static WARN_ONCE: Once = Once::new();
-
-fn warn_once() {
-    WARN_ONCE.call_once(|| {
-        eprintln!("sandbox=none: running without enforcement");
-    });
+    fn is_sandboxed(&self) -> bool {
+        (**self).is_sandboxed()
+    }
 }
+
+// ============================================================ NoneExecutor
+//
+// NOTE: the "running without enforcement" warning is deliberately NOT
+// printed here. The run entry points own it (PRINCIPLES.md P6.5: exactly
+// once per run) — an executor printing per-construction or per-job cannot
+// keep that promise.
 
 static WORKDIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -301,7 +310,6 @@ impl NoneExecutor {
 
 impl Executor for NoneExecutor {
     fn run(&self, job: &PreparedJob) -> std::result::Result<ExecResult, Report<Error>> {
-        warn_once();
         let staged = stage(job, &self.work_parent)
             .attach_with(|| format!("NoneExecutor: staging job {:?}", job.ik))?;
 

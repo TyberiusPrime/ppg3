@@ -16,7 +16,10 @@ pub enum Error {
     Canon(String),
     #[error("corrupt store: {0}")]
     CorruptStore(String),
-    #[error("determinism violation for input key {ik}:\n{report}")]
+    // The report carries the ik together with its on-disk memo-link path
+    // (PRINCIPLES.md P9.4: no bare hash without an accompanying path), so
+    // the headline doesn't repeat it bare.
+    #[error("determinism violation (same inputs produced different outputs):\n{report}")]
     DeterminismViolation { ik: String, report: String },
     #[error("store is read-only: {0}")]
     ReadOnlyStore(String),

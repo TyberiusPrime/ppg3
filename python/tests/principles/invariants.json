@@ -5,98 +5,253 @@
       "id": "P1",
       "title": "Identity is content, not names",
       "invariants": [
-        {"id": "P1.1", "status": "violated", "summary": "no public job constructor accepts name="},
-        {"id": "P1.2", "status": "enforced", "summary": "equal jobs with different destinations coexist without conflict"},
-        {"id": "P1.3", "status": "violated", "summary": "changing only a published path causes zero rebuilds and a working link"},
-        {"id": "P1.4", "status": "violated", "summary": "entry content layout derives from output names, never publish paths"},
-        {"id": "P1.5", "status": "violated", "summary": "user-facing job references show published paths and/or definition site"}
+        {
+          "id": "P1.1",
+          "status": "enforced",
+          "summary": "no public job constructor accepts name="
+        },
+        {
+          "id": "P1.2",
+          "status": "enforced",
+          "summary": "equal jobs with different destinations coexist without conflict"
+        },
+        {
+          "id": "P1.3",
+          "status": "enforced",
+          "summary": "changing only a published path causes zero rebuilds and a working link"
+        },
+        {
+          "id": "P1.4",
+          "status": "enforced",
+          "summary": "entry content layout derives from output names, never publish paths"
+        },
+        {
+          "id": "P1.5",
+          "status": "enforced",
+          "summary": "user-facing job references show published paths and/or definition site"
+        }
       ]
     },
     {
       "id": "P2",
       "title": "The only conflict is a contested destination",
       "invariants": [
-        {"id": "P2.1", "status": "violated", "summary": "two different jobs on one destination: error naming both call sites"},
-        {"id": "P2.2", "status": "violated", "summary": "identical jobs, different destinations: built once, linked twice"},
-        {"id": "P2.3", "status": "violated", "summary": "no 'duplicate job id' error class exists; identical redefinition merges"}
+        {
+          "id": "P2.1",
+          "status": "enforced",
+          "summary": "two different jobs on one destination: error naming both call sites"
+        },
+        {
+          "id": "P2.2",
+          "status": "enforced",
+          "summary": "identical jobs, different destinations: built once, linked twice"
+        },
+        {
+          "id": "P2.3",
+          "status": "enforced",
+          "summary": "no 'duplicate job id' error class exists; identical redefinition merges"
+        }
       ]
     },
     {
       "id": "P3",
       "title": "One truth; everything else is a pointer or a cache",
       "invariants": [
-        {"id": "P3.1", "status": "violated", "summary": "zero writable stores fails at run start, once, as a config error"},
-        {"id": "P3.2", "status": "enforced", "summary": "deleting every cache-class file costs zero rebuilds"},
-        {"id": "P3.3", "status": "enforced", "summary": "deleting the project dir (keeping the store) costs zero rebuilds"},
-        {"id": "P3.4", "status": "untested", "summary": "generation pointer state has one authoritative form; disagreement is detected"}
+        {
+          "id": "P3.1",
+          "status": "enforced",
+          "summary": "zero writable stores fails at run start, once, as a config error"
+        },
+        {
+          "id": "P3.2",
+          "status": "enforced",
+          "summary": "deleting every cache-class file costs zero rebuilds"
+        },
+        {
+          "id": "P3.3",
+          "status": "enforced",
+          "summary": "deleting the project dir (keeping the store) costs zero rebuilds"
+        },
+        {
+          "id": "P3.4",
+          "status": "enforced",
+          "summary": "generation pointer state has one authoritative form; disagreement is detected",
+          "note": "ppg3.verify_generation(project_dir) cross-checks record vs tree both ways"
+        }
       ]
     },
     {
       "id": "P4",
       "title": "A declared input is a readable input",
       "invariants": [
-        {"id": "P4.1", "status": "enforced", "summary": "File inputs are byte-identical readable inside the job"},
-        {"id": "P4.2", "status": "enforced", "summary": "parent-job inputs expose the parent's bytes"},
-        {"id": "P4.3", "status": "enforced", "summary": "subset refs key on exactly the named output (per-output early cutoff)"},
-        {"id": "P4.4", "status": "enforced", "summary": "Params are readable via io.params, value-identical"}
+        {
+          "id": "P4.1",
+          "status": "enforced",
+          "summary": "File inputs are byte-identical readable inside the job"
+        },
+        {
+          "id": "P4.2",
+          "status": "enforced",
+          "summary": "parent-job inputs expose the parent's bytes"
+        },
+        {
+          "id": "P4.3",
+          "status": "enforced",
+          "summary": "subset refs key on exactly the named output (per-output early cutoff)"
+        },
+        {
+          "id": "P4.4",
+          "status": "enforced",
+          "summary": "Params are readable via io.params, value-identical"
+        }
       ]
     },
     {
       "id": "P5",
       "title": "Same key, same bytes; everything that runs is an input",
       "invariants": [
-        {"id": "P5.1", "status": "enforced", "summary": "different bytes under an existing input key is a hard failure"},
-        {"id": "P5.2", "status": "violated", "summary": "the violation report names both entries on disk and the next command"},
-        {"id": "P5.3", "status": "enforced", "summary": "a tool hash change is a key change (rebuild)"},
-        {"id": "P5.4", "status": "enforced", "summary": "declared env keys the job; undeclared env is invisible"}
+        {
+          "id": "P5.1",
+          "status": "enforced",
+          "summary": "different bytes under an existing input key is a hard failure"
+        },
+        {
+          "id": "P5.2",
+          "status": "enforced",
+          "summary": "the violation report names both entries on disk and the next command"
+        },
+        {
+          "id": "P5.3",
+          "status": "enforced",
+          "summary": "a tool hash change is a key change (rebuild)"
+        },
+        {
+          "id": "P5.4",
+          "status": "enforced",
+          "summary": "declared env keys the job; undeclared env is invisible"
+        }
       ]
     },
     {
       "id": "P6",
       "title": "The sandbox is a feature you can hold",
       "invariants": [
-        {"id": "P6.1", "status": "violated", "summary": "ppg3.new(sandbox=...) exists and reaches executor selection"},
-        {"id": "P6.2", "status": "untested", "summary": "sandbox='require' without enforcement fails at run start"},
-        {"id": "P6.3", "status": "violated", "summary": "undeclared input is ENOENT inside the job"},
-        {"id": "P6.4", "status": "enforced", "summary": "manifests record the enforcement that actually applied"},
-        {"id": "P6.5", "status": "violated", "summary": "unenforced runs warn exactly once per run"}
+        {
+          "id": "P6.1",
+          "status": "enforced",
+          "summary": "ppg3.new(sandbox=...) exists and reaches executor selection"
+        },
+        {
+          "id": "P6.2",
+          "status": "enforced",
+          "summary": "sandbox='require' without enforcement fails at run start",
+          "note": "asserted on hosts without enforcement; skips where bwrap+nix exist (require then succeeds)"
+        },
+        {
+          "id": "P6.3",
+          "status": "untested",
+          "summary": "undeclared input is ENOENT inside the job",
+          "note": "wiring landed (sandbox=auto/require selects BwrapExecutor); flip to enforced after the first green run on a bwrap+nix host (nix CI)"
+        },
+        {
+          "id": "P6.4",
+          "status": "enforced",
+          "summary": "manifests record the enforcement that actually applied"
+        },
+        {
+          "id": "P6.5",
+          "status": "enforced",
+          "summary": "unenforced runs warn exactly once per run"
+        }
       ]
     },
     {
       "id": "P7",
       "title": "A fetch pin is an identity, not a comment",
       "invariants": [
-        {"id": "P7.1", "status": "violated", "summary": "the declared hash participates in the input key"},
-        {"id": "P7.2", "status": "violated", "summary": "removing the pin (interactive) refetches and re-pins, never hits silently"},
-        {"id": "P7.3", "status": "enforced", "summary": "changing the URL refetches even when matching content exists"},
-        {"id": "P7.4", "status": "violated", "summary": "verification failure reports url, both hashes, and the rejected bytes' path"}
+        {
+          "id": "P7.1",
+          "status": "enforced",
+          "summary": "the declared hash participates in the input key"
+        },
+        {
+          "id": "P7.2",
+          "status": "enforced",
+          "summary": "removing the pin (interactive) refetches and re-pins, never hits silently"
+        },
+        {
+          "id": "P7.3",
+          "status": "enforced",
+          "summary": "changing the URL refetches even when matching content exists"
+        },
+        {
+          "id": "P7.4",
+          "status": "enforced",
+          "summary": "verification failure reports url, both hashes, and the rejected bytes' path"
+        }
       ]
     },
     {
       "id": "P8",
       "title": "Finished work is never withheld",
       "invariants": [
-        {"id": "P8.1", "status": "enforced", "summary": "after a failed run, succeeded jobs rerun as pure hits"},
-        {"id": "P8.2", "status": "violated", "summary": "a failed run leaves an inspectable, marked partial generation"},
-        {"id": "P8.3", "status": "enforced", "summary": "current never points at a partial snapshot"}
+        {
+          "id": "P8.1",
+          "status": "enforced",
+          "summary": "after a failed run, succeeded jobs rerun as pure hits"
+        },
+        {
+          "id": "P8.2",
+          "status": "enforced",
+          "summary": "a failed run leaves an inspectable, marked partial generation"
+        },
+        {
+          "id": "P8.3",
+          "status": "enforced",
+          "summary": "current never points at a partial snapshot"
+        }
       ]
     },
     {
       "id": "P9",
       "title": "Every failure names its artifacts",
       "invariants": [
-        {"id": "P9.1", "status": "violated", "summary": "job-failure blocks include the definition site"},
-        {"id": "P9.2", "status": "enforced", "summary": "failure blocks include a log path; single failures inline the log tail"},
-        {"id": "P9.3", "status": "violated", "summary": "violation/mismatch reports include on-disk paths of every artifact mentioned"},
-        {"id": "P9.4", "status": "violated", "summary": "no bare hash appears without an accompanying path or name"}
+        {
+          "id": "P9.1",
+          "status": "enforced",
+          "summary": "job-failure blocks include the definition site"
+        },
+        {
+          "id": "P9.2",
+          "status": "enforced",
+          "summary": "failure blocks include a log path; single failures inline the log tail"
+        },
+        {
+          "id": "P9.3",
+          "status": "enforced",
+          "summary": "violation/mismatch reports include on-disk paths of every artifact mentioned"
+        },
+        {
+          "id": "P9.4",
+          "status": "enforced",
+          "summary": "no bare hash appears without an accompanying path or name"
+        }
       ]
     },
     {
       "id": "P10",
       "title": "One word per concept",
       "invariants": [
-        {"id": "P10.1", "status": "violated", "summary": "job constructors take outputs=; view= does not exist"},
-        {"id": "P10.2", "status": "violated", "summary": "a job without published outputs is legal (internal job)"}
+        {
+          "id": "P10.1",
+          "status": "enforced",
+          "summary": "job constructors take outputs=; view= does not exist"
+        },
+        {
+          "id": "P10.2",
+          "status": "enforced",
+          "summary": "a job without published outputs is legal (internal job)"
+        }
       ]
     }
   ]

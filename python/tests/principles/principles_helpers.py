@@ -120,19 +120,19 @@ def new_graph(tmp_path, **kwargs):
 def file_job(outputs, run, **kwargs):
     import ppg3
 
-    return ppg3.FileJob(view=outputs, run=run, **kwargs)
+    return ppg3.FileJob(outputs=outputs, run=run, **kwargs)
 
 
 def command_job(outputs, argv, **kwargs):
     import ppg3
 
-    return ppg3.CommandJob(view=outputs, argv=argv, **kwargs)
+    return ppg3.CommandJob(outputs=outputs, argv=argv, **kwargs)
 
 
 def fetch_job(output, url, **kwargs):
     import ppg3
 
-    return ppg3.FetchJob(view=output, url=url, **kwargs)
+    return ppg3.FetchJob(outputs=output, url=url, **kwargs)
 
 
 def run_graph(graph, project_id="principles"):

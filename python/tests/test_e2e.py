@@ -61,11 +61,11 @@ def _make_graph(tmp_path, n=1):
         paranoid=True,
     )
     cmd_job = ppg3.CommandJob(
-        view={"greeting": "greeting.txt"},
+        outputs={"greeting": "greeting.txt"},
         argv=["/bin/sh", "-c", "echo hello > {out:greeting}"],
     )
     ppg3.FileJob(
-        view={"summary": "summary.txt"},
+        outputs={"summary": "summary.txt"},
         run=_make_summary,
         inputs={"greeting": cmd_job, "cfg": ppg3.Params({"n": n})},
     )
@@ -125,11 +125,11 @@ def test_e2e_graphjob_expansion_runs_and_publishes(tmp_path):
         # A closure is fine here: GraphJob callbacks run in-process via
         # `RunCallbacks.expand_graph_job` (no (de)serialization at all).
         ppg3.CommandJob(
-            view={"out": "generated.txt"},
+            outputs={"out": "generated.txt"},
             argv=["/bin/sh", "-c", "echo generated > {out:out}"],
         )
 
-    ppg3.GraphJob(expand, name="expand-job")
+    ppg3.GraphJob(expand)
     r = ppg3.run(g, project_id="graphjob-e2e")
     assert r.failed == {}
     assert "generated.txt" in r.built
@@ -146,8 +146,8 @@ def test_e2e_partial_failure_raises_and_leaves_view_untouched(tmp_path):
         project_dir=str(tmp_path / ".ppg3"),
         frozen=False,
     )
-    ppg3.CommandJob(view={"ok": "ok.txt"}, argv=["/bin/sh", "-c", "echo ok > {out:ok}"])
-    ppg3.CommandJob(view={"bad": "bad.txt"}, argv=["/bin/sh", "-c", "exit 7"])
+    ppg3.CommandJob(outputs={"ok": "ok.txt"}, argv=["/bin/sh", "-c", "echo ok > {out:ok}"])
+    ppg3.CommandJob(outputs={"bad": "bad.txt"}, argv=["/bin/sh", "-c", "exit 7"])
 
     with pytest.raises(PPGRunError) as exc_info:
         ppg3.run(g, project_id="fail-e2e")
@@ -208,11 +208,11 @@ def _make_env_pipeline(base_dir, forkserver):
         forkserver=forkserver,
     )
     cmd_job = ppg3.CommandJob(
-        view={"greeting": "greeting.txt"},
+        outputs={"greeting": "greeting.txt"},
         argv=["/bin/sh", "-c", "echo hello > {out:greeting}"],
     )
     ppg3.FileJob(
-        view={"summary": "summary.txt"},
+        outputs={"summary": "summary.txt"},
         run=_make_summary,
         inputs={"greeting": cmd_job, "cfg": ppg3.Params({"n": 1})},
     )
@@ -236,8 +236,8 @@ def test_e2e_warm_template_reuse(tmp_path):
         frozen=False,
         paranoid=True,
     )
-    ppg3.FileJob(view={"a": "a.txt"}, run=_write_ppid)
-    ppg3.FileJob(view={"b": "b.txt"}, run=_write_ppid)
+    ppg3.FileJob(outputs={"a": "a.txt"}, run=_write_ppid)
+    ppg3.FileJob(outputs={"b": "b.txt"}, run=_write_ppid)
     r = ppg3.run(g, project_id="warm-template")
     assert r.failed == {}
 
@@ -266,7 +266,7 @@ def test_e2e_preload_actually_imported(tmp_path):
         frozen=False,
         paranoid=True,
     )
-    ppg3.FileJob(view={"out": "check.txt"}, run=_write_preload_check)
+    ppg3.FileJob(outputs={"out": "check.txt"}, run=_write_preload_check)
     r = ppg3.run(g, project_id="preload-check")
     assert r.failed == {}
     content = (tmp_path / "outputs" / "check.txt").read_text()
@@ -290,7 +290,7 @@ def test_e2e_template_env_scrubbed(tmp_path, monkeypatch):
         frozen=False,
         paranoid=True,
     )
-    ppg3.FileJob(view={"out": "env.json"}, run=_write_env_dump)
+    ppg3.FileJob(outputs={"out": "env.json"}, run=_write_env_dump)
     r = ppg3.run(g, project_id="env-scrub")
     assert r.failed == {}
     env = json.loads((tmp_path / "outputs" / "env.json").read_text())

@@ -814,10 +814,13 @@ fn cmd_generations_keep(
 // ---- rollback ----
 
 fn cmd_rollback(project_dir: &Path, generation: Option<u64>, json: bool) -> Result<i32, AppError> {
+    // Capture where we're rolling *from* so we can tell the user how to
+    // return — a rollback is just a repoint, fully reversible.
+    let from = views::current_generation_number(project_dir)?;
     let target = match generation {
         Some(n) => n,
         None => {
-            let current = views::current_generation_number(project_dir)?.ok_or_else(|| {
+            let current = from.ok_or_else(|| {
                 AppError::Operational("no current generation to roll back from".to_string())
             })?;
             views::previous_existing_generation(project_dir, current)?.ok_or_else(|| {
@@ -827,9 +830,16 @@ fn cmd_rollback(project_dir: &Path, generation: Option<u64>, json: bool) -> Resu
     };
     views::rollback(project_dir, target)?;
     if json {
-        print_json(&serde_json::json!({"rolled_back_to": target}))?;
+        print_json(&serde_json::json!({"rolled_back_to": target, "rolled_back_from": from}))?;
     } else {
         println!("rolled back to generation {target}");
+        // "how to get back": rollback is reversible — name the exact command.
+        match from {
+            Some(prev) if prev != target => {
+                println!("  (was generation {prev}; `ppg3 rollback {prev}` to return)");
+            }
+            _ => {}
+        }
     }
     Ok(0)
 }

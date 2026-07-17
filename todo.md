@@ -158,8 +158,12 @@ and the error is bad, and I don't even think that 'name=' should be a thing.
 -- 
 rollback ux is shit. 
 It needs at least to print how to get back.
+  [RESOLVED — rollback now prints the generation it came from and the exact
+   `ppg3 rollback <prev>` to return; JSON gains `rolled_back_from`.]
 
 It needs to be able to produce the link tree in a different folder.
+  [RESOLVED — `ppg3 materialize <dest> --generation N` (see above) writes any
+   generation's tree into a folder of your choosing.]
 
 -- 
 where is the 'materialize' command that turns an output folder into 

@@ -307,7 +307,9 @@ fn rollback_default_goes_to_previous_generation() {
         .arg("rollback")
         .assert()
         .success()
-        .stdout(predicate::str::contains(n1.to_string()));
+        .stdout(predicate::str::contains(n1.to_string()))
+        // "how to get back": names the exact command to return to gen 2.
+        .stdout(predicate::str::contains("ppg3 rollback 2"));
 
     assert_eq!(
         std::fs::read_to_string(project_dir.join("views/current/out.txt")).unwrap(),

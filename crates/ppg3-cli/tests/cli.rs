@@ -360,6 +360,62 @@ fn diff_entries_cli_reports_changed_file() {
 }
 
 #[test]
+fn diff_entries_diff_flag_shows_line_level_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("store");
+    let store = Store::open("main", &store_dir, false).unwrap();
+    let doc = serde_json::json!({"ppg3_key_version": 1});
+    let oh1 = publish(
+        &store,
+        &"7".repeat(64),
+        &doc,
+        &[("out.txt", b"alpha\nbeta\ngamma\n"), ("gone.txt", b"old\n")],
+    );
+    let oh2 = publish(
+        &store,
+        &"8".repeat(64),
+        &doc,
+        &[
+            ("out.txt", b"alpha\nBETA\ngamma\n"),
+            ("added.txt", b"fresh\n"),
+        ],
+    );
+
+    let out = Command::cargo_bin("ppg3")
+        .unwrap()
+        .args(["diff-entries", &oh1, &oh2, "--diff", "--store"])
+        .arg(&store_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    // Changed file: the single altered line shows as -/+ around context.
+    assert!(text.contains("-beta"), "missing removed line:\n{text}");
+    assert!(text.contains("+BETA"), "missing added line:\n{text}");
+    assert!(text.contains(" alpha"), "missing context line:\n{text}");
+    // Added and removed whole files show their content one-sided.
+    assert!(text.contains("+fresh"), "missing added-file body:\n{text}");
+    assert!(
+        text.contains("  - gone.txt"),
+        "missing removed-file entry:\n{text}"
+    );
+    assert!(text.contains("-old"), "missing removed-file body:\n{text}");
+
+    // Without --diff the content lines are absent (summary only).
+    let plain = Command::cargo_bin("ppg3")
+        .unwrap()
+        .args(["diff-entries", &oh1, &oh2, "--store"])
+        .arg(&store_dir)
+        .output()
+        .unwrap();
+    let plain_text = String::from_utf8(plain.stdout).unwrap();
+    assert!(
+        !plain_text.contains("+BETA"),
+        "content leaked without --diff"
+    );
+}
+
+#[test]
 fn store_verify_succeeds_then_fails_after_corruption() {
     let tmp = tempfile::tempdir().unwrap();
     let store_dir = tmp.path().join("store");

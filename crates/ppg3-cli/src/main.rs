@@ -181,6 +181,11 @@ enum Command {
         /// Store path; defaults to the project's sole configured store.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Also show the actual line-level content diff of each changed
+        /// (and added/removed) text file, not just the summary. Binary or
+        /// very large files are noted but not diffed.
+        #[arg(long)]
+        diff: bool,
     },
     /// blake3-hash files, in the same lowercase-hex form ppg3 uses for
     /// output hashes (`oh`). Handy for checking by hand whether a file
@@ -384,9 +389,14 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             let project_dir = config::resolve_project_dir(project.as_deref())?;
             cmd_explain(&project_dir, &view_path, json)
         }
-        Command::DiffEntries { oh1, oh2, store } => {
+        Command::DiffEntries {
+            oh1,
+            oh2,
+            store,
+            diff,
+        } => {
             let store = config::resolve_single_store(store.as_deref())?;
-            cmd_diff_entries(&store, &oh1, &oh2, json)
+            cmd_diff_entries(&store, &oh1, &oh2, diff, json)
         }
         Command::Blake3sum { paths } => cmd_blake3sum(&paths, json),
     }
@@ -899,30 +909,148 @@ fn print_keydoc_diff_human(indent: &str, diff: &explain::KeyDocDiff) {
 
 // ---- diff-entries ----
 
-fn cmd_diff_entries(store_path: &Path, oh1: &str, oh2: &str, json: bool) -> Result<i32, AppError> {
+fn cmd_diff_entries(
+    store_path: &Path,
+    oh1: &str,
+    oh2: &str,
+    show_diff: bool,
+    json: bool,
+) -> Result<i32, AppError> {
     let store = Store::open(&store_display_name(store_path), store_path, true)?;
     let diff = explain::diff_entries(&store, oh1, oh2)?;
     if json {
+        // The `--diff` payload stays a human affordance; JSON keeps the
+        // stable structured summary so machine consumers are unaffected.
         print_json(&diff)?;
     } else {
         println!("diff {oh1} -> {oh2}");
+        let (dir_a, dir_b) = (store.data_dir(oh1), store.data_dir(oh2));
         for p in &diff.added {
             println!("  + {p}");
+            if show_diff {
+                print_one_sided_content('+', &dir_b.join(p));
+            }
         }
         for p in &diff.removed {
             println!("  - {p}");
+            if show_diff {
+                print_one_sided_content('-', &dir_a.join(p));
+            }
         }
         for c in &diff.changed {
             println!(
                 "  ~ {} (size {}->{}, first differing byte offset {:?})",
                 c.path, c.size_a, c.size_b, c.first_diff_offset
             );
+            if show_diff {
+                print_changed_content(&dir_a.join(&c.path), &dir_b.join(&c.path));
+            }
         }
         if diff.added.is_empty() && diff.removed.is_empty() && diff.changed.is_empty() {
             println!("  (identical)");
         }
     }
     Ok(0)
+}
+
+/// Cap on how much of a file we read for `--diff`; beyond this we show a
+/// note rather than paging megabytes of build output into the terminal.
+const DIFF_MAX_BYTES: u64 = 1 << 20; // 1 MiB
+/// LCS is O(n*m) in space; refuse to diff beyond this line-cell product.
+const DIFF_MAX_CELLS: usize = 4_000_000;
+
+/// Read a store file as UTF-8 text for `--diff`, or return `Err` with a
+/// short human note (binary, too large, unreadable) to print instead.
+fn read_text_for_diff(path: &Path) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("unreadable ({e})"))?;
+    if meta.len() > DIFF_MAX_BYTES {
+        return Err(format!("{} bytes, too large to diff", meta.len()));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("unreadable ({e})"))?;
+    if bytes.contains(&0) {
+        return Err("binary".to_string());
+    }
+    String::from_utf8(bytes).map_err(|_| "binary (not utf-8)".to_string())
+}
+
+/// Print every line of a single added/removed file, prefixed with `+`/`-`
+/// to match the unified `text_line_diff` output.
+fn print_one_sided_content(sign: char, path: &Path) {
+    match read_text_for_diff(path) {
+        Ok(text) => {
+            for line in text.lines() {
+                println!("      {sign}{line}");
+            }
+        }
+        Err(note) => println!("      ({note})"),
+    }
+}
+
+/// Print the line-level diff of a changed file's two versions.
+fn print_changed_content(path_a: &Path, path_b: &Path) {
+    let (a, b) = match (read_text_for_diff(path_a), read_text_for_diff(path_b)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(note), _) | (_, Err(note)) => {
+            println!("      ({note})");
+            return;
+        }
+    };
+    for line in text_line_diff(&a, &b) {
+        println!("      {line}");
+    }
+}
+
+/// Minimal line-level diff of two text blobs via an LCS DP + backtrack,
+/// yielding ` `/`-`/`+`-prefixed lines (context / removed / added). Kept
+/// self-contained (no external diff crate). Falls back to a plain
+/// removed-then-added block when the inputs are too big for the O(n*m) DP.
+fn text_line_diff(a: &str, b: &str) -> Vec<String> {
+    let a_lines: Vec<&str> = a.lines().collect();
+    let b_lines: Vec<&str> = b.lines().collect();
+    let (n, m) = (a_lines.len(), b_lines.len());
+
+    if n.saturating_mul(m) > DIFF_MAX_CELLS {
+        let mut out = Vec::with_capacity(n + m);
+        out.push("(too large for line diff; showing removed then added)".to_string());
+        out.extend(a_lines.iter().map(|l| format!("-{l}")));
+        out.extend(b_lines.iter().map(|l| format!("+{l}")));
+        return out;
+    }
+
+    // lcs[i][j] = length of the LCS of a_lines[i..] and b_lines[j..].
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a_lines[i] == b_lines[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a_lines[i] == b_lines[j] {
+            out.push(format!(" {}", a_lines[i]));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push(format!("-{}", a_lines[i]));
+            i += 1;
+        } else {
+            out.push(format!("+{}", b_lines[j]));
+            j += 1;
+        }
+    }
+    for line in &a_lines[i..] {
+        out.push(format!("-{line}"));
+    }
+    for line in &b_lines[j..] {
+        out.push(format!("+{line}"));
+    }
+    out
 }
 
 // ---- blake3sum ----
@@ -996,7 +1124,24 @@ fn cmd_blake3sum(paths: &[PathBuf], json: bool) -> Result<i32, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_epoch_ms;
+    use super::{fmt_epoch_ms, text_line_diff};
+
+    #[test]
+    fn text_line_diff_reports_change_in_context() {
+        let a = "alpha\nbeta\ngamma\n";
+        let b = "alpha\nBETA\ngamma\n";
+        assert_eq!(
+            text_line_diff(a, b),
+            vec![" alpha", "-beta", "+BETA", " gamma"]
+        );
+    }
+
+    #[test]
+    fn text_line_diff_pure_add_and_remove() {
+        assert_eq!(text_line_diff("", "x\ny\n"), vec!["+x", "+y"]);
+        assert_eq!(text_line_diff("x\ny\n", ""), vec!["-x", "-y"]);
+        assert!(text_line_diff("same\n", "same\n") == vec![" same"]);
+    }
 
     // Expected values cross-checked against Python's
     // `datetime.fromtimestamp(s, timezone.utc)`.

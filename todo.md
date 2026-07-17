@@ -181,6 +181,9 @@ explain should list the diff-entries command.
   [RESOLVED — `explain`'s human output now prints the ready-to-run
    `ppg3 diff-entries <oh_a> <oh_b>` for the two entries it compared.]
 diff enries should offer to actually diff the damn files...
+  [RESOLVED — `ppg3 diff-entries A B --diff` now prints the line-level
+   content diff of each changed file (self-contained LCS) plus the bodies of
+   added/removed files; binary/oversized files are noted, not dumped.]
 
 -- 
 gc does nothing. even after removing all the generations

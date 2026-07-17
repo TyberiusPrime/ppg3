@@ -158,6 +158,43 @@ fn generations_command_finds_ppg3_walking_up_from_subdirectory() {
 }
 
 #[test]
+fn jj_add_ignores_is_idempotent_and_preserves_existing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (project_root, _project_dir, _store) = setup_project(tmp.path());
+
+    // Pre-existing .gitignore with an unrelated entry must be preserved.
+    let gitignore = project_root.join(".gitignore");
+    std::fs::write(&gitignore, "*.pyc\n").unwrap();
+
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .arg("jj-add-ignores")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/.ppg3/"));
+
+    let after = std::fs::read_to_string(&gitignore).unwrap();
+    assert!(after.contains("*.pyc\n"), "existing entry lost");
+    assert!(after.contains("/.ppg3/"));
+    assert!(after.contains("/outputs"));
+
+    // Second run adds nothing (idempotent) and says so.
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .arg("jj-add-ignores")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already ignores"));
+
+    // Exactly one occurrence of each entry — no duplication.
+    let final_text = std::fs::read_to_string(&gitignore).unwrap();
+    assert_eq!(final_text.matches("/.ppg3/").count(), 1);
+    assert_eq!(final_text.matches("/outputs").count(), 1);
+}
+
+#[test]
 fn materialize_exports_a_real_file_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let (project_root, project_dir, store) = setup_project(tmp.path());

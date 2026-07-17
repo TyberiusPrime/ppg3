@@ -77,6 +77,9 @@ Open:
 - should we even have a new generation if output == output, and change_id==change_id?
 
 - need a ppg3 jj-add-ignores
+  [RESOLVED — `ppg3 jj-add-ignores` adds `/.ppg3/` and `/outputs` to the
+   project's `.gitignore` (jj honours it); idempotent, preserves existing
+   entries.]
 - how do I do a verify run?
 - how do I get from a store path to the python that generated it?
 

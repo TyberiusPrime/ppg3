@@ -187,6 +187,13 @@ enum Command {
         #[arg(long)]
         diff: bool,
     },
+    /// Add ppg3's derived paths (`.ppg3/`, `outputs`) to the project's
+    /// `.gitignore` so jj/git stop offering to track them (they're pointers
+    /// and caches, never sources — PRINCIPLES.md P3). Idempotent.
+    JjAddIgnores {
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
     /// Copy a generation's outputs into a plain directory of real, writable
     /// files (dereferencing the store symlinks) — a folder you can edit,
     /// archive, or hand off without the read-only store behind it.
@@ -417,6 +424,10 @@ fn run(cli: Cli) -> Result<i32, AppError> {
         } => {
             let project_dir = config::resolve_project_dir(project.as_deref())?;
             cmd_materialize(&project_dir, generation, &dest, json)
+        }
+        Command::JjAddIgnores { project } => {
+            let project_dir = config::resolve_project_dir(project.as_deref())?;
+            cmd_jj_add_ignores(&project_dir, json)
         }
         Command::Blake3sum { paths } => cmd_blake3sum(&paths, json),
     }
@@ -863,6 +874,64 @@ fn cmd_materialize(
             report.files,
             report.bytes,
         );
+    }
+    Ok(0)
+}
+
+// ---- jj-add-ignores ----
+
+/// ppg3's derived paths, ignored relative to the project root.
+const IGNORE_ENTRIES: [&str; 2] = ["/.ppg3/", "/outputs"];
+/// Marker so re-running is idempotent and the block is recognizable.
+const IGNORE_HEADER: &str = "# ppg3 derived paths (pointers + caches, not sources)";
+
+fn cmd_jj_add_ignores(project_dir: &Path, json: bool) -> Result<i32, AppError> {
+    let root = project_dir.parent().ok_or_else(|| {
+        AppError::Operational(format!(
+            "project dir {project_dir:?} has no parent to hold .gitignore"
+        ))
+    })?;
+    let gitignore = root.join(".gitignore");
+
+    let existing = match std::fs::read_to_string(&gitignore) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(AppError::Io(e.to_string())),
+    };
+    // Only append entries not already present (as their own line), so this
+    // never duplicates lines a user (or a prior run) already added.
+    let present: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
+    let missing: Vec<&str> = IGNORE_ENTRIES
+        .iter()
+        .copied()
+        .filter(|e| !present.contains(e))
+        .collect();
+
+    if !missing.is_empty() {
+        let mut out = existing.clone();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !present.contains(IGNORE_HEADER) {
+            out.push_str(IGNORE_HEADER);
+            out.push('\n');
+        }
+        for e in &missing {
+            out.push_str(e);
+            out.push('\n');
+        }
+        std::fs::write(&gitignore, out).map_err(|e| AppError::Io(e.to_string()))?;
+    }
+
+    if json {
+        print_json(&serde_json::json!({
+            "gitignore": gitignore.display().to_string(),
+            "added": missing,
+        }))?;
+    } else if missing.is_empty() {
+        println!("{} already ignores all ppg3 paths", gitignore.display());
+    } else {
+        println!("added to {}: {}", gitignore.display(), missing.join(", "));
     }
     Ok(0)
 }

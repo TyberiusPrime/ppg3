@@ -852,6 +852,10 @@ fn print_explanation_human(explanation: &Explanation) {
                 "{view_path}: generation {previous_generation} ({oh_a}) -> {current_generation} ({oh_b})"
             );
             print_keydoc_diff_human("  ", diff);
+            // Point the user at the command that shows the per-file content
+            // changes between these two entries (--store now auto-resolves
+            // for a single-store project).
+            println!("  see the per-file diff: ppg3 diff-entries {oh_a} {oh_b}");
             for step in why_chain {
                 println!(
                     "  why (depth {}): input {:?} changed ({} -> {})",

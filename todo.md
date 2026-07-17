@@ -178,6 +178,8 @@ generations keep even do?
 
 --
 explain should list the diff-entries command.
+  [RESOLVED — `explain`'s human output now prints the ready-to-run
+   `ppg3 diff-entries <oh_a> <oh_b>` for the two entries it compared.]
 diff enries should offer to actually diff the damn files...
 
 -- 

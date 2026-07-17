@@ -227,6 +227,8 @@ worst case it's a redownload, not a 'and we updated all the urls').
 
 
 -- we need a ppg3 blake3sum command
+  [RESOLVED — `ppg3 blake3sum <paths...>` (or stdin via `-`/no args),
+   prints `<hash>  <path>` like sha256sum, `--json` for machine output.]
 
 
 

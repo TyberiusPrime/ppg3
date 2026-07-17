@@ -181,6 +181,14 @@ enum Command {
         #[arg(long)]
         store: PathBuf,
     },
+    /// blake3-hash files, in the same lowercase-hex form ppg3 uses for
+    /// output hashes (`oh`). Handy for checking by hand whether a file
+    /// matches a store entry. Output is `<hash>  <path>`, like `sha256sum`;
+    /// use `-` (or pass no paths) to hash stdin.
+    Blake3sum {
+        /// Files to hash; `-` means stdin. With no paths, reads stdin.
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -296,7 +304,9 @@ fn run(cli: Cli) -> Result<i32, AppError> {
                 dry_run,
                 evict_logs,
                 yes,
-            } => cmd_store_gc(&store, level, max_size, min_age, dry_run, evict_logs, yes, json),
+            } => cmd_store_gc(
+                &store, level, max_size, min_age, dry_run, evict_logs, yes, json,
+            ),
             StoreCmd::Nuke { store, yes } => cmd_store_nuke(&store, yes, json),
             StoreCmd::Verify {
                 sample,
@@ -362,6 +372,7 @@ fn run(cli: Cli) -> Result<i32, AppError> {
             cmd_explain(&project_dir, &view_path, json)
         }
         Command::DiffEntries { oh1, oh2, store } => cmd_diff_entries(&store, &oh1, &oh2, json),
+        Command::Blake3sum { paths } => cmd_blake3sum(&paths, json),
     }
 }
 
@@ -861,4 +872,73 @@ fn cmd_diff_entries(store_path: &Path, oh1: &str, oh2: &str, json: bool) -> Resu
         }
     }
     Ok(0)
+}
+
+// ---- blake3sum ----
+
+/// blake3-hash each requested file (or stdin), printing `<hash>  <path>`
+/// lines in the same lowercase-hex form ppg3 uses for output hashes. Mirrors
+/// `sha256sum`: hashing continues past a failing path and the exit code is 1
+/// if any path failed.
+fn cmd_blake3sum(paths: &[PathBuf], json: bool) -> Result<i32, AppError> {
+    use std::io::Read;
+
+    // No operands is the coreutils convention for "hash stdin".
+    let stdin_path = PathBuf::from("-");
+    let targets: &[PathBuf] = if paths.is_empty() {
+        std::slice::from_ref(&stdin_path)
+    } else {
+        paths
+    };
+
+    #[derive(Serialize)]
+    struct Blake3Line {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        blake3: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    }
+
+    let mut lines = Vec::with_capacity(targets.len());
+    let mut any_err = false;
+    for path in targets {
+        let result = if path.as_os_str() == "-" {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map(|_| ppg3_core::hash::blake3_hex(&buf))
+                .map_err(|e| e.to_string())
+        } else {
+            ppg3_core::hash::blake3_file(path).map_err(|e| e.to_string())
+        };
+        let display = path.display().to_string();
+        match result {
+            Ok(hash) => {
+                if !json {
+                    println!("{hash}  {display}");
+                }
+                lines.push(Blake3Line {
+                    path: display,
+                    blake3: Some(hash),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                any_err = true;
+                if !json {
+                    eprintln!("blake3sum: {display}: {e}");
+                }
+                lines.push(Blake3Line {
+                    path: display,
+                    blake3: None,
+                    error: Some(e),
+                });
+            }
+        }
+    }
+    if json {
+        print_json(&lines)?;
+    }
+    Ok(if any_err { 1 } else { 0 })
 }

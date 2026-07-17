@@ -37,6 +37,9 @@ Open:
 -- when no writeable store is defined, fail early, not at every damn job
 
 -- we are corrently loosing the file names on our python tracebacks. Add those back in.
+  [RESOLVED — frames carry their real filename again; and the `_shim.py`
+   breadcrumb line was malformed (`_shim.py":<lineno>`, no indent) — now a
+   clean `  <file>:<lineno>, in <name> (details skipped)`.]
 
 - is producing extra files an error? do they get hashed?
   or are non-view files just not exported into the output?

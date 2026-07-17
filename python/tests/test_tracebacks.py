@@ -100,3 +100,54 @@ def test_format_failures_lists_all(tmp_path):
     assert "Job:       a.txt" in table and "Job:       b.txt" in table
     # per-job fields present.
     assert "Exception:" in table and "Log:" in table and "Outputs:" in table
+
+
+def test_shim_frames_get_a_clean_breadcrumb_line():
+    """ppg3's worker-shim frames are collapsed to a single, well-formed
+    breadcrumb: real filename kept, no stray quote, indented like every
+    other frame, and their source/locals suppressed (regression guard for
+    the malformed ``_shim.py":<lineno>`` line)."""
+    from ppg3._traceback import Frame, Stack, Trace
+
+    # Build a Trace from a throwaway exception, then swap in a hand-made
+    # stack so we can assert on the _shim frame's rendering deterministically.
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        import sys
+
+        trace = Trace(*sys.exc_info())
+
+    shim_file = "/some/where/ppg3/_shim.py"
+    user_file = "/proj/analysis.py"
+    trace.stacks = [
+        Stack(
+            exc_type="ValueError",
+            exc_value="boom",
+            frames=[
+                Frame(
+                    filename=shim_file,
+                    lineno=42,
+                    name="run_in_process",
+                    locals={"secret": "should-not-render"},
+                    source="line1\nline2\nline3\n",
+                ),
+                Frame(
+                    filename=user_file,
+                    lineno=2,
+                    name="_boom",
+                    locals={},
+                    source="def _boom(io):\n    raise ValueError('boom')\n",
+                ),
+            ],
+        )
+    ]
+
+    out = trace.format()
+
+    assert f"  {shim_file}:42, in run_in_process (details skipped)" in out
+    assert '_shim.py":' not in out, "stray quote in shim breadcrumb"
+    # Shim frame's source/locals are suppressed...
+    assert "should-not-render" not in out
+    # ...but the real user frame still renders its source.
+    assert "raise ValueError('boom')" in out

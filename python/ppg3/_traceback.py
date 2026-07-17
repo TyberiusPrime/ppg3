@@ -170,8 +170,14 @@ class Trace:
             out.append("Traceback (most recent call last):")
 
             for frame in stack.frames:
-                if 'ppg3/_shim.py' in frame.filename:
-                    out.append(f'{frame.filename}":{frame.lineno}, in {frame.name} (details skipped)')
+                if "ppg3/_shim.py" in frame.filename:
+                    # ppg3's worker shim is plumbing, not the user's code:
+                    # keep a one-line breadcrumb (with the real filename) but
+                    # skip its source context and locals.
+                    out.append(
+                        f"  {frame.filename}:{frame.lineno}, "
+                        f"in {frame.name} (details skipped)"
+                    )
                     continue
                 out.append(f"  {frame.filename}:{frame.lineno}, in {frame.name}")
                 if frame.source:

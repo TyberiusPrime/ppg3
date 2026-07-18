@@ -11,7 +11,9 @@ Publishing is spelled ``outputs=`` (P10): a dict mapping output *names* (how
 the job itself refers to its files, and how they are laid out inside the
 store entry — see P1.4) to destinations in the output tree. ``outputs`` is
 optional — a job without it is an internal job that simply doesn't appear in
-the output tree.
+the output tree — and a ``None`` destination declares an output *name*
+(written by the job, part of its key, consumable by children) without
+publishing it (P10.2's internal jobs).
 
 Each job's ``.job_def(graph)`` method assembles the CONTRACT.md ``JobDef``
 dict (destined for ``ppg3._core.run(jobs_json, ...)``); nothing here ever
@@ -415,16 +417,25 @@ def _require_current_graph() -> Graph:
     return _current_graph
 
 
-def _normalize_outputs(outputs: Any, kind: str) -> Dict[str, str]:
-    """``outputs=`` (P10): None (internal job) | dict name -> destination."""
+def _normalize_outputs(outputs: Any, kind: str) -> Dict[str, Optional[str]]:
+    """``outputs=`` (P10): None (internal job) | dict name -> destination.
+
+    A ``None`` destination declares the output *name* (it is written by the
+    job, keyed, and consumable — P1.4/P10.2) without publishing it into the
+    output tree: an internal output."""
     if outputs is None:
         return {}
     if isinstance(outputs, dict):
         for k, v in outputs.items():
-            if not isinstance(k, str) or not isinstance(v, str) or not k or not v:
+            if (
+                not isinstance(k, str)
+                or not k
+                or not (v is None or (isinstance(v, str) and v))
+            ):
                 raise DefinitionError(
                     f"{kind}(outputs=...): expected a dict of output-name -> "
-                    f"output-tree path (both non-empty str); got {k!r}: {v!r}"
+                    "output-tree path (non-empty str), or -> None for an "
+                    f"internal (unpublished) output; got {k!r}: {v!r}"
                 )
         return dict(outputs)
     raise DefinitionError(
@@ -433,7 +444,9 @@ def _normalize_outputs(outputs: Any, kind: str) -> Dict[str, str]:
     )
 
 
-def _apply_below(publish: Dict[str, str], below: Optional[str], kind: str) -> Dict[str, str]:
+def _apply_below(
+    publish: Dict[str, Optional[str]], below: Optional[str], kind: str
+) -> Dict[str, Optional[str]]:
     """``below=``: prefix every output destination with a folder — pure
     convenience for "put all this job's outputs below folder X", so a batch
     of destinations doesn't repeat the folder in every path. Publish-layer
@@ -452,7 +465,10 @@ def _apply_below(publish: Dict[str, str], below: Optional[str], kind: str) -> Di
             f"{kind}(below={below!r}): must be a relative folder path with "
             "no '.'/'..' components"
         )
-    return {name: f"{norm}/{dest}" for name, dest in publish.items()}
+    return {
+        name: f"{norm}/{dest}" if dest is not None else None
+        for name, dest in publish.items()
+    }
 
 
 # --------------------------------------------------------------------------
@@ -614,11 +630,17 @@ def _callable_source_file(fn: Callable) -> Optional[str]:
 class Job:
     kind = "base"
 
-    def __init__(self, graph: Graph, publish: Dict[str, str]):
+    def __init__(self, graph: Graph, outputs_spec: Dict[str, Optional[str]]):
         self.graph = graph
-        # P10: the publish map, output name -> destination in the output
-        # tree. May be empty (internal job).
-        self.publish = dict(publish) if publish else {}
+        # P10: output name -> destination in the output tree, or None for a
+        # declared-but-unpublished (internal) output. May be empty.
+        self.outputs_spec = dict(outputs_spec) if outputs_spec else {}
+        # The publish map proper — only the outputs that appear in the
+        # output tree. Everything view-layer reads this; identity (output
+        # *names*, P1.4) reads outputs_spec.
+        self.publish = {
+            k: v for k, v in self.outputs_spec.items() if v is not None
+        }
         # P1.5: how humans find this job.
         self.defsite_chain = _user_call_chain()
         # jj support: the file this job constructor was called from is a
@@ -635,7 +657,7 @@ class Job:
         there is no user-assignable name."""
         return {
             "kind": self.kind,
-            "publish": dict(sorted(self.publish.items())),
+            "publish": dict(sorted(self.outputs_spec.items())),
         }
 
     def _register(self) -> None:
@@ -662,6 +684,12 @@ class Job:
         return f"<{self.kind} @ {where}>"
 
     def __getitem__(self, name: str) -> OutputRef:
+        declared = self.output_names()
+        if name not in declared:
+            raise DefinitionError(
+                f"{self!r} (defined at {self.defsite}) has no declared "
+                f"output {name!r}; declared outputs: {declared}"
+            )
         return OutputRef(self, name)
 
     def __repr__(self) -> str:
@@ -669,8 +697,9 @@ class Job:
 
     def output_names(self) -> List[str]:
         """Declared output names — entry-internal layout (P1.4). Defaults to
-        the publish map's keys; subclasses with fixed names override."""
-        return sorted(self.publish.keys())
+        the outputs spec's keys (published or not); subclasses with fixed
+        names override."""
+        return sorted(self.outputs_spec.keys())
 
     def job_def(self, graph: Optional[Graph] = None) -> Dict[str, Any]:
         raise NotImplementedError
@@ -688,7 +717,7 @@ class FileJob(Job):
 
     def __init__(
         self,
-        outputs: Optional[Dict[str, str]] = None,
+        outputs: Optional[Dict[str, Optional[str]]] = None,
         run: Union[Callable, Source, None] = None,
         tools: Sequence[ToolSpec] = (),
         inputs: Optional[Dict[str, Any]] = None,
@@ -701,7 +730,9 @@ class FileJob(Job):
     ):
         """
         outputs = output name -> output-tree destination (optional: omit
-                  for an internal job that is not published)
+                  for an internal job that is not published; a None
+                  destination declares the name — written, keyed,
+                  consumable — without publishing it)
         run     = what we execute (callable or ppg3.Source)
         tools   = what's in the sandbox
         inputs  = upstream jobs / files / params
@@ -817,7 +848,7 @@ class CommandJob(Job):
 
     def __init__(
         self,
-        outputs: Optional[Dict[str, str]] = None,
+        outputs: Optional[Dict[str, Optional[str]]] = None,
         argv: Optional[Sequence[Any]] = None,
         tools: Sequence[ToolSpec] = (),
         inputs: Optional[Dict[str, Any]] = None,
@@ -1115,7 +1146,7 @@ class UnsandboxedJob(Job):
     def __init__(
         self,
         run: Callable,
-        outputs: Optional[Union[str, Dict[str, str]]] = None,
+        outputs: Optional[Union[str, Dict[str, Optional[str]]]] = None,
         inputs: Optional[Dict[str, Any]] = None,
         env: Optional[Dict[str, str]] = None,
         resources: Optional[Resources] = None,

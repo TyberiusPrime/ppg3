@@ -93,3 +93,20 @@ def test_unenforced_runs_warn_exactly_once_per_run(tmp_path, capfd):
         f"running without enforcement must be loud exactly once per run "
         f"(not per job, not zero): got {warnings!r}"
     )
+
+
+@requires_core
+@principle("P6.5")
+def test_sandbox_off_is_explicit_and_never_nags(tmp_path, capfd):
+    # The other half of the knob: `off` is an explicit, recorded choice —
+    # zero warnings, not one.
+    g = new_graph(tmp_path, sandbox="off")
+    command_job({"out": "a.txt"}, argv=["/bin/sh", "-c", "echo a > {out:out}"])
+    r = run_graph(g)
+    assert r.failed == {}
+    err = capfd.readouterr().err
+    warnings = [ln for ln in err.splitlines() if "sandbox" in ln.lower()]
+    assert warnings == [], (
+        f"sandbox='off' was chosen explicitly — nagging about it teaches "
+        f"users to ignore warnings: got {warnings!r}"
+    )

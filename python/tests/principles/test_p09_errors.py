@@ -60,3 +60,26 @@ def test_single_failure_shows_log_path_and_inlines_the_evidence(tmp_path):
         "the job's own words (stderr tail) were not inlined for a "
         "single-failure run"
     )
+
+
+@requires_core
+@principle("P9.4")
+def test_ordinary_failure_blocks_carry_no_bare_hashes(tmp_path):
+    # P9.4 is stated for *all* user-facing failure text, but its other test
+    # (test_p05_determinism.py) only sees the determinism-violation report.
+    # Ordinary job-failure blocks must satisfy it too.
+    g = new_graph(tmp_path)
+    command_job({"out": "fails.txt"}, argv=["/bin/sh", "-c", "exit 1"])
+    with pytest.raises(Exception) as ei:
+        run_graph(g)
+    logical = re.sub(r"\n {8,}", " ", str(ei.value))
+    hex64 = re.compile(r"\b[0-9a-f]{64}\b")
+    bare = [
+        line
+        for line in logical.splitlines()
+        if hex64.search(line) and "/" not in line and "://" not in line
+    ]
+    assert bare == [], (
+        f"hashes with no path/name next to them are archaeology, not a "
+        f"report: {bare!r}"
+    )

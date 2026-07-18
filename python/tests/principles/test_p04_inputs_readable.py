@@ -26,8 +26,13 @@ def _two_outputs(io):
 
 
 def _consume_stable(io):
-    with open(io.path("out"), "w") as fh:
-        fh.write("consumed\n")
+    # Read the subset input's bytes: P4's preamble makes readability half of
+    # what declaring an input means — a subset ref that keys correctly but
+    # cannot be opened is exactly the hash-only split P4 forbids.
+    with open(io.input("s"), "rb") as fh:
+        payload = fh.read()
+    with open(io.path("out"), "wb") as fh:
+        fh.write(b"consumed: " + payload)
 
 
 def _write_params(io):
@@ -80,11 +85,12 @@ def test_subset_ref_keys_on_exactly_the_named_output(tmp_path):
     r1 = build(1)
     assert r1.failed == {}
     assert len(r1.built) == 2
+    assert (tmp_path / "outputs" / "consumed").read_bytes() == b"consumed: constant\n"
 
     r2 = build(2)
     assert r2.failed == {}
-    assert "vary" in " ".join(r2.built) or len(r2.built) >= 1  # parent reran
-    assert "consumed" in " ".join(r2.hits), (
+    assert "stable+vary" in r2.built, "the params change must rerun the parent"
+    assert "consumed" in r2.hits, (
         "the consumer depends on parent['stable'] only — a change confined "
         "to the sibling output must not rebuild it"
     )

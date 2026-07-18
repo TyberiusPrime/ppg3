@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import os
 import sys
 from typing import Any, Dict, List, Optional
@@ -266,7 +267,20 @@ class RunResult:
         reason = detail.get("reason") or self.failed.get(name, "")
         exc = _last_meaningful_line(reason)
         if exc:
-            self._wrapped_field(lines, "Exception", exc)
+            # The scheduler's reason opens with the internal job handle
+            # (`job "j…" exited …`); the block header already names the job
+            # in the user's terms (P1.5) — strip the handle, and drop the
+            # line entirely when it would only repeat the Exit field.
+            m = re.match(r'^job "[^"]+" (.+)$', exc, re.DOTALL)
+            if m:
+                exc = m.group(1)
+            duplicates_exit = (
+                exit_code is not None
+                and detail.get("kind") == "command"
+                and exc == f"exited with code {exit_code}"
+            )
+            if not duplicates_exit:
+                self._wrapped_field(lines, "Exception", exc)
 
         # Output-contract failures: name the declared outputs the job never
         # wrote (the entry path with what it *did* write follows as

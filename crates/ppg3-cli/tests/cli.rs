@@ -544,7 +544,12 @@ fn store_verify_succeeds_then_fails_after_corruption() {
         .assert()
         .failure()
         .code(1)
-        .stdout(predicate::str::contains("FAIL"));
+        .stdout(predicate::str::contains("FAIL"))
+        // P9.4: a failing entry is named by its on-disk path, never only
+        // its hash — the entry dir is what the user opens next.
+        .stdout(predicate::str::contains(
+            store.entry_dir(&oh).display().to_string(),
+        ));
 }
 
 #[test]

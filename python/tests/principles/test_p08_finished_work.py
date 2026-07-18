@@ -36,7 +36,7 @@ def test_succeeded_jobs_survive_a_failed_run_as_hits(tmp_path):
 @requires_core
 @principle("P8.2")
 def test_failed_run_leaves_an_inspectable_partial_tree(tmp_path):
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as ei:
         run_graph(_mixed_graph(tmp_path, fixed=False))
 
     # good.txt finished before the run failed. Its bytes must be reachable
@@ -55,6 +55,19 @@ def test_failed_run_leaves_an_inspectable_partial_tree(tmp_path):
     assert found, (
         "no browsable path to the finished job's output exists after the "
         "failed run — 899 finished jobs hidden because the 900th failed"
+    )
+
+    # ... and the failure report *says where it is* (the invariant's
+    # "reports its path" half): a partial tree nobody is told about is
+    # store archaeology with extra steps.
+    msg = str(ei.value)
+    reported = [
+        tok.rstrip(".,:;)")
+        for tok in msg.split()
+        if "partial" in tok and os.path.isdir(tok.rstrip(".,:;)"))
+    ]
+    assert reported, (
+        f"the failure report never names the partial tree's path (got: {msg!r})"
     )
 
 

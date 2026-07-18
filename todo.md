@@ -68,6 +68,11 @@ Open:
   can't have conflicts on job_ids, but are they truly necessary?
   and if not, should we mayhaps link them so users can find their jobs?
   because right now, they do not end up in store at al.o
+  [RESOLVED — internal jobs are legal (P10.2): omit `outputs=` entirely, or
+   declare an output without publishing it via a None destination
+   (`outputs={"data": None}`) — written by the job, keyed, consumable by
+   children, cached in the store, just absent from the output tree. There
+   is no user-facing job id; consumers hold the job object / `job["name"]`.]
 
 - can't rm -rf the store?
   I mean I get it... maybe we add a ppg3 nuke-store
@@ -103,6 +108,11 @@ Open:
    project's `.gitignore` (jj honours it); idempotent, preserves existing
    entries.]
 - how do I do a verify run?
+  [PARTIAL — `ppg3 store verify [--sample PCT|--entry OH]` re-hashes entries
+   against their manifests; sampling now always includes unsandboxed
+   entries first (P6: first-choice re-verification targets) and failures
+   name the entry directory, not just the hash. A rebuild-and-compare
+   verify (re-run jobs, diff against the stored entry) is still open.]
 - how do I get from a store path to the python that generated it?
   [PARTIAL — from an *output-tree* path: `ppg3 why <path>` (definition site,
    status, root cause, entry/log paths). From a raw entries/<oh> path: still
@@ -136,6 +146,11 @@ on the cli every second...
 - tools should support tofu! Should we split the hash and the flake-ref
 
 - how do I even enable the sandbox?
+  [RESOLVED — `ppg3.new(sandbox="require" | "auto" | "off")` (P6.1/P6.2);
+   `auto` is the default and warns once per run when enforcement is
+   unavailable; `off` never nags. Needs bwrap + nix on PATH for real
+   enforcement (P6.3 stays `untested` in the principles manifest until a
+   host with both runs the suite).]
 
 
 - the error message on job-contract violation (producing two different outputs from the same inputs)
@@ -261,6 +276,10 @@ how do I even change the output folder?
 
 --
 failing command jobs are only detected because of missing output?
+  [VERIFIED NOT SO — a nonzero exit code fails the job even when every
+   declared output was written (scheduler.rs checks exit_code before
+   publish; the staging dir is kept and reported as Outputs:/Kept:).
+   Missing outputs are a *second*, independent failure class.]
 
 
 

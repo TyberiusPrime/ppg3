@@ -60,11 +60,15 @@ def test_deleting_all_caches_costs_zero_rebuilds(tmp_path):
     r1 = run_graph(g1)
     assert r1.failed == {}
 
-    # Cache class: stat-cache and store logs. Deleting them may cost
-    # re-hashing — never a rebuild, never lost history.
+    # Cache class: stat-cache, store logs, and the last-run report
+    # (`ppg3 why`'s source). Deleting them may cost re-hashing or a lost
+    # answer to "why" — never a rebuild, never lost history.
     statcache = tmp_path / ".ppg3" / "statcache.sqlite"
     assert statcache.exists()
     statcache.unlink()
+    last_run = tmp_path / ".ppg3" / "last_run.json"
+    if last_run.exists():
+        last_run.unlink()
     logs = tmp_path / "store" / "v1" / "logs"
     if logs.is_dir():
         shutil.rmtree(logs)

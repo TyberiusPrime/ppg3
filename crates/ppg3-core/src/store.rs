@@ -296,6 +296,13 @@ impl PublishOutcome {
 #[derive(Debug, Clone, Serialize)]
 pub struct VerifyReport {
     pub oh: String,
+    /// Absolute entry directory — every report names the artifact it is
+    /// about (PRINCIPLES.md P9.4: no bare hash without a path).
+    pub path: String,
+    /// From the manifest's `built.sandboxed`: whether real enforcement
+    /// applied when this entry was built (P6.4). Unsandboxed entries are
+    /// the first-choice re-verification targets (P6).
+    pub sandboxed: bool,
     pub ok: bool,
     pub mismatches: Vec<String>,
 }
@@ -768,6 +775,8 @@ impl Store {
         }
         Ok(VerifyReport {
             oh: oh.to_string(),
+            path: entry_dir.display().to_string(),
+            sandboxed: manifest.built.sandboxed,
             ok: mismatches.is_empty(),
             mismatches,
         })

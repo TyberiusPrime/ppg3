@@ -97,7 +97,8 @@
         {
           "id": "P4.3",
           "status": "enforced",
-          "summary": "subset refs key on exactly the named output (per-output early cutoff)"
+          "summary": "subset refs key on exactly the named output (per-output early cutoff)",
+          "note": "single-name subset refs mount exactly the named output file; the consumer test reads its bytes"
         },
         {
           "id": "P4.4",
@@ -161,7 +162,8 @@
         {
           "id": "P6.5",
           "status": "enforced",
-          "summary": "unenforced runs warn exactly once per run"
+          "summary": "unenforced runs warn exactly once per run",
+          "note": "both halves: 'auto' warns exactly once, 'off' never nags"
         }
       ]
     },
@@ -177,7 +179,8 @@
         {
           "id": "P7.2",
           "status": "enforced",
-          "summary": "removing the pin (interactive) refetches and re-pins, never hits silently"
+          "summary": "removing the pin (interactive) refetches and re-pins, never hits silently",
+          "note": "interactive TOFU re-pin plus the frozen half: pinless FetchJob is a definition-time error"
         },
         {
           "id": "P7.3",
@@ -203,7 +206,8 @@
         {
           "id": "P8.2",
           "status": "enforced",
-          "summary": "a failed run leaves an inspectable, marked partial generation"
+          "summary": "a failed run leaves an inspectable, marked partial generation",
+          "note": "asserts the partial tree exists AND that the failure report names its path"
         },
         {
           "id": "P8.3",
@@ -234,7 +238,8 @@
         {
           "id": "P9.4",
           "status": "enforced",
-          "summary": "no bare hash appears without an accompanying path or name"
+          "summary": "no bare hash appears without an accompanying path or name",
+          "note": "checked on determinism-violation reports and ordinary job-failure blocks"
         }
       ]
     },
@@ -250,7 +255,8 @@
         {
           "id": "P10.2",
           "status": "enforced",
-          "summary": "a job without published outputs is legal (internal job)"
+          "summary": "a job without published outputs is legal (internal job)",
+          "note": "outputs={'name': None} declares an internal (unpublished) output; engine test consumes one end-to-end"
         }
       ]
     }

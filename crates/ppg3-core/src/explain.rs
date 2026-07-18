@@ -426,6 +426,14 @@ pub fn explain_view_path(
 /// CONTRACT.md `explain.rs` API, but lives here rather than in `store.rs`
 /// (out of scope to modify) since `Store::entries_dir()` is only
 /// `pub(crate)`.
+/// Whether entry `oh` was built with real enforcement, from its manifest's
+/// `built.sandboxed` (P6.4). `None` when the manifest is missing/unreadable
+/// — callers deciding re-verification priority (P6: unsandboxed entries are
+/// first-choice targets) should treat that as "not known sandboxed".
+pub fn entry_is_sandboxed(store: &Store, oh: &str) -> Option<bool> {
+    read_manifest_by_oh(store, oh).ok().map(|m| m.built.sandboxed)
+}
+
 pub fn list_entries(store: &Store) -> Result<Vec<String>, Error> {
     let mut names = store::list_dir_names(&store.entries_dir())?;
     // entries_dir should only ever contain 64-hex-char oh directories, but

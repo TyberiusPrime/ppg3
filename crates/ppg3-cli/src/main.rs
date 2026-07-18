@@ -585,7 +585,22 @@ fn cmd_store_verify(
         vec![oh]
     } else {
         let all = explain::list_entries(&store)?;
-        select_deterministic_sample(&all, sample.unwrap_or(100.0))
+        match sample {
+            None => all,
+            Some(pct) => {
+                // P6: entries built without enforcement are the
+                // first-choice re-verification targets — they are always in
+                // the sample; the deterministic draw applies to the
+                // sandboxed rest.
+                let (unsandboxed, sandboxed): (Vec<String>, Vec<String>) = all
+                    .into_iter()
+                    .partition(|oh| explain::entry_is_sandboxed(&store, oh) != Some(true));
+                let mut picked = unsandboxed;
+                picked.extend(select_deterministic_sample(&sandboxed, pct));
+                picked.sort();
+                picked
+            }
+        }
     };
 
     let mut reports = Vec::with_capacity(targets.len());
@@ -602,10 +617,15 @@ fn cmd_store_verify(
         print_json(&reports)?;
     } else {
         for r in &reports {
+            let badge = if r.sandboxed { "" } else { "  (unsandboxed)" };
             if r.ok {
-                println!("OK    {}", r.oh);
+                println!("OK    {}{badge}", r.oh);
             } else {
-                println!("FAIL  {}", r.oh);
+                // P9.4: the failing entry is named by its on-disk path, not
+                // only its hash — inspecting that directory is the user's
+                // next action.
+                println!("FAIL  {}{badge}", r.oh);
+                println!("        entry: {}", r.path);
                 for m in &r.mismatches {
                     println!("        {m}");
                 }

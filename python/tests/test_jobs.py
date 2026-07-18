@@ -238,6 +238,34 @@ def test_input_lowering_job_subset(graph):
 
 
 @requires_blake3
+def test_subset_ref_to_undeclared_output_errors_at_definition_time(graph):
+    # A typo'd subset name would otherwise only surface as a run-time
+    # scheduling failure; catch it while the user is still on the line that
+    # wrote it, and name the valid choices.
+    upstream = ppg3.FileJob(outputs={"fasta": "ref/fasta.fa", "log": "ref/log"}, run=dummy_run)
+    with pytest.raises(DefinitionError) as ei:
+        upstream["fastq"]
+    msg = str(ei.value)
+    assert "fastq" in msg and "fasta" in msg and "log" in msg
+
+
+@requires_blake3
+def test_internal_output_via_none_destination(graph):
+    # outputs={"name": None}: declared (identity, entry layout, consumable)
+    # but unpublished — P10.2's internal jobs.
+    job = ppg3.FileJob(outputs={"data": None, "pub": "results/pub.txt"}, run=dummy_run)
+    assert job.output_names() == ["data", "pub"]
+    assert job.publish == {"pub": "results/pub.txt"}
+    jd = job.job_def(graph)
+    assert jd["outputs_declared"] == ["data", "pub"]
+    assert jd["view"] == {"pub": "results/pub.txt"}
+    # below= applies to real destinations only.
+    j2 = ppg3.FileJob(outputs={"data": None, "pub": "pub.txt"}, run=dummy_run, below="s1")
+    assert j2.publish == {"pub": "s1/pub.txt"}
+    assert j2.output_names() == ["data", "pub"]
+
+
+@requires_blake3
 def test_input_lowering_whole_job(graph):
     upstream = ppg3.FileJob(outputs={"fasta": "ref/fasta.fa"}, run=dummy_run)
     downstream = ppg3.FileJob(

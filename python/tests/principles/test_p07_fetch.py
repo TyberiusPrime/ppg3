@@ -88,6 +88,22 @@ def test_removing_the_pin_refetches_and_repins(tmp_path, capsys):
     assert (tmp_path / "outputs" / "in" / "data.bin").read_bytes() == b"second content"
 
 
+@principle("P7.2")
+def test_frozen_rejects_a_pinless_fetch_at_definition_time(tmp_path):
+    # The non-interactive half of the pin-removal story (P7 preamble):
+    # frozen/CI runs must refuse an unpinned fetch *at definition time* —
+    # TOFU is an interactive-only door, never something CI walks through
+    # silently.
+    new_graph(tmp_path, frozen=True)
+    with pytest.raises(Exception) as ei:
+        fetch_job("in/data.bin", url="file:///never-fetched")
+    msg = str(ei.value).lower()
+    assert "frozen" in msg and "blake3" in msg, (
+        f"the error must say what was rejected (the missing pin) and why "
+        f"(frozen mode): {msg!r}"
+    )
+
+
 @requires_core
 @principle("P7.3")
 def test_changing_the_url_refetches_even_with_matching_content(tmp_path):

@@ -714,7 +714,17 @@ fn dispatch_argv_job(
                         "internal scheduling error: missing completed info for parent {id:?}"
                     ))
                 })?;
-                let source = shared.storeset.stores[c.store_idx].data_dir(&c.oh);
+                let data_dir = shared.storeset.stores[c.store_idx].data_dir(&c.oh);
+                // A single-name subset (`parent["x"]`) exposes exactly
+                // output `x` (PRINCIPLES.md P4.3) — the sibling outputs the
+                // job did not declare are not readable inside it. Whole-job
+                // inputs (and multi-name subsets) expose the entry dir.
+                let source = match r {
+                    InputRef::JobSubset { names, .. } if names.len() == 1 => {
+                        data_dir.join(&names[0])
+                    }
+                    _ => data_dir,
+                };
                 input_mounts.push(Mount {
                     virtual_path: format!("/ppg/in/{name}"),
                     source,
@@ -1135,13 +1145,13 @@ fn lower_token(
 /// `{in:NAME}` -> the mount root `/ppg/in/NAME`, *unless* the parent's
 /// manifest has exactly one file, in which case it points directly at that
 /// file (`/ppg/in/NAME/<that file>`) — a documented convenience so
-/// single-file jobs don't need to know their own output's filename.
-/// `{out}` -> `/ppg/out`. `{out:NAME}` -> `/ppg/out/<job.view[NAME]>`
-/// (job.view is the only NAME-keyed source of output paths; `outputs_declared`
-/// is a plain `Vec<String>` with no names, so `view` is what actually
-/// resolves a `NAME` to a relative path — see STATUS.md for why this
-/// reading was chosen over the literal but self-contradictory CONTRACT.md
-/// phrasing). `{tool:NAME}` -> `/ppg/tools/NAME`.
+/// single-file jobs don't need to know their own output's filename. A
+/// single-name subset input (`parent["x"]`) is mounted as exactly that
+/// file (P4.3), so its placeholder is `/ppg/in/NAME` with no suffix.
+/// `{out}` -> `/ppg/out`. `{out:NAME}` -> `/ppg/out/<NAME>` — the output
+/// *name*, never the publish destination (P1.4: entry layout must not be
+/// shaped by where a generation links an output).
+/// `{tool:NAME}` -> `/ppg/tools/NAME`.
 fn resolve_placeholder(
     token: &str,
     job: &JobDef,
@@ -1166,6 +1176,10 @@ fn resolve_placeholder(
             // A File input is bound directly at /ppg/in/<name> (the file
             // itself), so the placeholder is that path with no filename suffix.
             InputRef::File { .. } => Ok(Some(format!("/ppg/in/{name}"))),
+            // Mounted as exactly the named file (P4.3): no suffix.
+            InputRef::JobSubset { names, .. } if names.len() == 1 => {
+                Ok(Some(format!("/ppg/in/{name}")))
+            }
             InputRef::Job { id } | InputRef::JobSubset { id, .. } => {
                 let c = completed.get(id).ok_or_else(|| {
                     Error::Other(format!(
@@ -1570,6 +1584,27 @@ mod tests {
             "data".to_string(),
             InputRef::Job {
                 id: "p".to_string(),
+            },
+        );
+        let job = argv_job("a", inputs);
+        let completed = completed_with("p", &["a.txt", "b.txt"]);
+        assert_eq!(
+            lower_token("{in:data}", &job, &completed).unwrap(),
+            "/ppg/in/data"
+        );
+    }
+
+    #[test]
+    fn lower_token_in_placeholder_single_name_subset_points_at_mounted_file() {
+        // `parent["x"]` mounts exactly output `x` at /ppg/in/<name> (P4.3),
+        // even when the parent's entry holds several files — so the
+        // placeholder is the mount path itself, no filename suffix.
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "data".to_string(),
+            InputRef::JobSubset {
+                id: "p".to_string(),
+                names: vec!["a.txt".to_string()],
             },
         );
         let job = argv_job("a", inputs);

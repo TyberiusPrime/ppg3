@@ -57,8 +57,10 @@ class JobIO:
     # -- inputs -----------------------------------------------------------
     def input(self, name: str) -> Path:
         """Real path of a declared input, as a :class:`pathlib.Path`. A
-        single input name maps to a single path (a job that depends on
-        another job's whole output gets that output's directory)."""
+        single input name maps to a single path: a ``ppg3.File`` or a
+        subset reference (``parent["x"]``) is the file itself; a whole-job
+        dependency is the parent entry's directory (its file when the
+        parent has exactly one output)."""
         try:
             return Path(self._inputs[name])
         except KeyError:

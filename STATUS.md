@@ -683,6 +683,57 @@ Totals after this WP: 180 Rust tests unchanged (no Rust touched;
 suites not run by that command) + 122 Python tests (101 prior + 21 new in
 `test_watch.py`), all green.
 
+## Webwatch — HTTP status frontend for watch mode (phase 1) — done
+
+`python -m ppg3 webwatch <script>` runs the *same* loop as `watch` (it
+calls `watch.run_watch` unchanged) and additionally serves a read-only
+status page on `127.0.0.1:8787` (`--host`/`--port`; `--port 0` picks an
+ephemeral port): current loop state, per-pass history (built/hit/failed
+counts, generation numbers, durations), error drill-down (per-job failure
+details from the RunReport — exception summary, log/output paths, full
+reason blob — and definition-pass tracebacks), live-updated via
+Server-Sent Events. New: `python/ppg3/webwatch.py`,
+`python/tests/test_webwatch.py`. Additive: `watch.run_watch` grew an
+optional `on_event` observer (structured, JSON-serializable event dicts;
+observer exceptions are swallowed so a broken frontend can never kill the
+loop; console output byte-identical with or without it), `__main__.py`'s
+manual flag parser was generalized to a spec-driven `_extract_flags`
+(behavior of `watch` unchanged, covered by the existing parser tests).
+
+Notable decisions:
+
+- Same no-third-party-deps rule that made watch.py poll instead of
+  inotify: stdlib `ThreadingHTTPServer` + SSE (no websockets in the
+  stdlib; SSE auto-reconnects for free) + one embedded vanilla-JS HTML
+  page (no build step, ships in the wheel). Server binds localhost by
+  default and is strictly read-only (GET `/`, `/api/state`,
+  `/api/events`).
+- Every SSE message is a full state snapshot, not a delta: state is small
+  (run history bounded at 50), reconnects need no resync protocol, and a
+  stalled client just has intermediate snapshots dropped from its bounded
+  queue.
+- Phase 2 (paging through previous generations of an output path,
+  `explain`-diff integration, live per-job progress) is planned to work
+  off a runner-written event log in `.ppg3/` that this server (or a
+  standalone one) tails — the `WatchEvent` dicts are deliberately
+  JSON-serializable (asserted in tests) so they can become JSONL lines
+  as-is.
+- E2E test drives a real `python -m ppg3 webwatch` subprocess on
+  `--port 0`, parses the bound port from the serving line on stdout,
+  and asserts generations 1 and 2 appear both on disk and in
+  `/api/state`, then clean exit 0 on SIGINT — same deadline/kill
+  discipline as `test_watch.py`. It also sets `PYTHONPATH` for the
+  subprocess so it passes in a bare dev checkout (no `maturin develop`),
+  which the older watch E2E tests require.
+- Manually verified end-to-end outside pytest (scratch pipeline,
+  Chromium screenshots in light + dark `prefers-color-scheme`): failure
+  drill-down blocks, live re-run on script/input edits, clean SIGINT
+  summary with the server attached.
+
+Totals after this WP: Rust untouched; +18 Python tests in
+`test_webwatch.py`, all green (pre-existing environment-dependent
+failures in the container unaffected).
+
 ## TOFU source patcher (§7.6, WP11-adjacent) — done
 
 Python-only (rule: touch only `python/ppg3/{jobs,run}.py`, new

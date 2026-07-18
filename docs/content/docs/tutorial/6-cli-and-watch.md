@@ -88,6 +88,32 @@ When you're done, tear the warm session down (or just let the process exit):
 ppg3.session_stop()   # kill warm workers, clear the loader memo
 ```
 
+## Webwatch — watch mode with a status page
+
+`python -m ppg3 webwatch` is the same loop as `watch` — same re-run
+triggers, same ephemeral generations, same console output — plus a
+read-only status page served on localhost:
+
+```bash
+python -m ppg3 webwatch pipeline.py                  # http://127.0.0.1:8787/
+python -m ppg3 webwatch pipeline.py --port 9000
+python -m ppg3 webwatch pipeline.py --host 0.0.0.0   # careful: exposes it beyond localhost
+```
+
+The page live-updates (no reloading) and shows:
+
+- what the watcher is doing right now (running a pass / waiting for
+  changes), the watched-path set, and total run/failure counts;
+- a history of recent passes — which paths triggered each one, how long it
+  took, built/hit/failed counts, and the generation it wrote;
+- for failed runs, a per-job drill-down: the exception summary, runtime,
+  exit code, the failure-log and staged-output paths to inspect, and the
+  full error report; for a broken pipeline script, the Python traceback.
+
+There is also `GET /api/state` (the same data as JSON) if you want to
+script against it. The basic `watch` command is unaffected — use whichever
+fits.
+
 ## Where to go next
 
 You now have the full loop: **define** jobs in a Python script → **run** to

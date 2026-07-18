@@ -45,7 +45,7 @@ import sys
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Dict, IO, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, IO, Iterable, List, Optional, Sequence, Tuple
 
 from . import jobs as _jobs_module
 
@@ -59,6 +59,14 @@ from .run import PPGRunError, get_last_run_info, watch_mode
 
 # `(mtime_ns, size)` of a tracked path, or `None` if it does not exist.
 StatT = Optional[Tuple[int, int]]
+
+# A structured watch event: a JSON-serializable dict with at least "type"
+# (see `_emit`'s docstring for the event vocabulary) and "ts" (unix
+# seconds). JSON-serializability is deliberate: the planned runner-side
+# event log in `.ppg3/` (webwatch phase 2) will carry these same dicts,
+# one JSONL line each.
+WatchEvent = Dict[str, Any]
+WatchObserver = Callable[[WatchEvent], None]
 
 
 def _stat(path: str) -> StatT:
@@ -139,6 +147,35 @@ def _print(stream: IO[str], msg: str) -> None:
     stream.flush()
 
 
+def _emit(on_event: Optional[WatchObserver], event_type: str, **fields: Any) -> None:
+    """Deliver one structured event to :func:`run_watch`'s optional
+    observer. Event vocabulary (all carry ``ts``, unix seconds):
+
+    - ``pass_started``: ``n_run``, ``reason``, ``changed_paths`` (``None``
+      on the initial run, else the changed-path list that triggered it)
+    - ``pass_ok``: ``report`` (raw RunReport dict), ``generation``
+    - ``pass_run_failed``: ``report``, ``failed``, ``failed_details``,
+      ``job_kinds`` (RunResult's attributes), ``failures_text``
+      (``RunResult.format_failures()``)
+    - ``pass_exception``: ``traceback`` (formatted text)
+    - ``waiting``: ``watched_paths``
+    - ``stopped``: ``n_runs``, ``n_failures``
+
+    An observer exception is reported to stderr and swallowed — a broken
+    observer (e.g. the webwatch HTTP frontend) must never kill the watch
+    loop itself. ``KeyboardInterrupt`` still propagates: it is the loop's
+    one legitimate exit path.
+    """
+    if on_event is None:
+        return
+    event: WatchEvent = {"type": event_type, "ts": time.time(), **fields}
+    try:
+        on_event(event)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+
+
 def _run_definition_pass(script: str, script_args: Sequence[str]) -> None:
     """One definition pass: defensively reset the module-level
     "current graph" global (``ppg3.jobs._current_graph`` — regression guard
@@ -172,6 +209,7 @@ def run_watch(
     script_args: Sequence[str] = (),
     interval: float = 0.5,
     stream: Optional[IO[str]] = None,
+    on_event: Optional[WatchObserver] = None,
 ) -> int:
     """The ``python -m ppg3 watch <script> [args...]`` loop (§6.7).
 
@@ -183,6 +221,11 @@ def run_watch(
     script itself before any pass has ever produced one). Returns 0 (the
     process exit code for a clean Ctrl-C exit); this function only returns
     via ``KeyboardInterrupt``, never by falling off the end.
+
+    ``on_event``, if given, receives every loop transition as a structured
+    dict (see :func:`_emit` for the vocabulary) *in addition to* the
+    unchanged console output — this is how ``python -m ppg3 webwatch``
+    observes the loop without the basic watcher's behavior drifting.
     """
     stream = stream or sys.stdout
     script = os.path.abspath(script)
@@ -190,11 +233,19 @@ def run_watch(
     n_runs = 0
     n_failures = 0
     reason = "initial run"
+    changed: Optional[List[str]] = None
 
     try:
         while True:
             _print(stream, f"[{_timestamp()}] {reason}")
             n_runs += 1
+            _emit(
+                on_event,
+                "pass_started",
+                n_run=n_runs,
+                reason=reason,
+                changed_paths=changed,
+            )
             try:
                 _run_definition_pass(script, script_args)
             except PPGRunError as exc:
@@ -208,17 +259,28 @@ def run_watch(
                 )
                 for job_id, err in sorted(result.failed.items())[:5]:
                     _print(stream, f"    {job_id}: {err}")
+                _emit(
+                    on_event,
+                    "pass_run_failed",
+                    report=get_last_run_info().get("report"),
+                    failed=result.failed,
+                    failed_details=result.failed_details,
+                    job_kinds=result.job_kinds,
+                    failures_text=result.format_failures(),
+                )
             except KeyboardInterrupt:
                 raise
             except BaseException:
                 n_failures += 1
+                tb = traceback.format_exc()
                 _print(stream, "  definition pass raised (see stderr for traceback):")
                 # Deliberately real stderr (not `stream`, which defaults to
                 # stdout): tracebacks are diagnostic noise, not the
                 # iteration-status console output described in the module
                 # docstring, and the E2E test suite asserts on stderr here.
-                traceback.print_exc(file=sys.stderr)
+                sys.stderr.write(tb)
                 sys.stderr.flush()
+                _emit(on_event, "pass_exception", traceback=tb)
             else:
                 info = get_last_run_info()
                 _print(
@@ -226,11 +288,18 @@ def run_watch(
                     f"  ok: {_report_counts(info.get('report'))} "
                     f"generation={info.get('generation')}",
                 )
+                _emit(
+                    on_event,
+                    "pass_ok",
+                    report=info.get("report"),
+                    generation=info.get("generation"),
+                )
 
             info = get_last_run_info()
             watched = set(info.get("watched_paths") or [])
             watched.add(script)
             watcher.set_paths(watched)
+            _emit(on_event, "waiting", watched_paths=sorted(watched))
 
             changed = wait_for_change(watcher, interval)
             reason = f"change detected: {changed}"
@@ -240,4 +309,5 @@ def run_watch(
             f"[{_timestamp()}] stopped (SIGINT): {n_runs} run(s), "
             f"{n_failures} failure(s)",
         )
+        _emit(on_event, "stopped", n_runs=n_runs, n_failures=n_failures)
         return 0

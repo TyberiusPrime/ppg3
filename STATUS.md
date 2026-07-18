@@ -1113,3 +1113,46 @@ path against a scripted fake jj via `PPG3_JJ`, incl. two `requires_core`
 e2e runs asserting the meta.json vcs block and the hard-error paths, plus
 one `requires_real_jj` integration test that runs when a real jj is on
 PATH). Totals: 202 Rust + 165 Python tests (1 skipped without a real jj), clippy clean.
+
+## API-by-example docs, executed by the test suite — done
+
+New docs section `docs/content/docs/api/` (Hugo, next to the tutorial):
+`new.md` and `run.md` document **every** `ppg3.new()` / `ppg3.run()`
+parameter with a complete runnable script each; `jobs.md` covers all six
+job constructors; `inputs-and-outputs.md` the four input kinds, internal
+outputs, `below=`, the P2 conflict, and the full `io` surface;
+`job-parameters.md` the shared `env`/`resources`/`retain`/`store`/`tools`/
+`python` parameters.
+
+The examples are *executable documentation*: each carries a
+`<!-- ppg3-example: name [requires=core,nix] -->` marker, and
+`python/tests/test_docs_examples.py` extracts every marked block verbatim
+and runs it as a standalone script in a scratch directory (`requires=`
+becomes the suite's usual capability skips). A meta-test fails on any
+```python fence in those pages *without* a marker (`fragment` opts a
+sketch out explicitly), so new snippets can't dodge the harness; another
+guards the collector against silently matching nothing.
+
+Two engine gaps the examples flushed out, fixed here:
+
+a) **Readonly stores broke generation writes.** A run whose hits came from
+   a `Store(..., readonly=True)` failed at `write_generation` with "store
+   is read-only" — `add_root` (and `drop_generation`'s `remove_root`) hit
+   the writability guard. Both now skip readonly stores: `store gc` skips
+   them entirely, so roots there could never be consulted; their retention
+   is their owner's business (PPG3_DESIGN.md §4.1's shared-mirror shape).
+   Test: `core/tests/views.rs`
+   `readonly_store_entries_link_without_root_registration`.
+b) **Invalid `retain=` surfaced only at run time.** Constructors accepted
+   e.g. `retain="keep"` and the error appeared at `job_def()` lowering.
+   New `_resolve_retain` validates at definition time in all four
+   retain-taking constructors (fail-early, same as every other definition
+   error); covered by the `jp-retain` docs example.
+
+Also documented (as behavior, no code change): multi-output jobs appear in
+`RunResult` under one `dest1+dest2` label; `ppg3.Source` wants an absolute
+path since the file is re-read inside the job's own working directory.
+
+Totals: 270 Python tests green (2 skipped w/o real jj/golden), 37 of them
+docs examples; Rust suites green incl. the new views test; clippy clean;
+rustfmt clean on touched files.

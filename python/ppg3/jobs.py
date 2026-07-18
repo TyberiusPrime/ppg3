@@ -111,6 +111,15 @@ Retain.Default = Retain._Sentinel("Default")  # type: ignore[attr-defined]
 Retain.Evict = Retain._Sentinel("Evict")  # type: ignore[attr-defined]
 
 
+def _resolve_retain(retain: Any) -> Any:
+    """Default + validate a constructor's ``retain=`` at definition time —
+    a bad value is a definition error, not something to surface only once
+    ``job_def()`` lowers it at run time."""
+    retain = retain if retain is not None else Retain.Default
+    _retain_json(retain)
+    return retain
+
+
 def _retain_json(retain: Any) -> Any:
     if retain is Retain.Default:
         return "Default"
@@ -771,7 +780,7 @@ class FileJob(Job):
         self.inputs = dict(inputs or {})
         self.env = dict(env or {})
         self.resources = resources.pools if isinstance(resources, Resources) else {}
-        self.retain = retain if retain is not None else Retain.Default
+        self.retain = _resolve_retain(retain)
         self.python_env = python_env
         self.store = store
         self._transport = select_transport(run, python_env, paranoid=graph.paranoid)
@@ -868,7 +877,7 @@ class CommandJob(Job):
         self.inputs = dict(inputs or {})
         self.env = dict(env or {})
         self.resources = resources.pools if isinstance(resources, Resources) else {}
-        self.retain = retain if retain is not None else Retain.Default
+        self.retain = _resolve_retain(retain)
         self.store = store
         self._recipe = recipe.recipe_hash_command(self.argv_template)
         self._register()
@@ -1004,7 +1013,7 @@ class FetchJob(Job):
         # §7.6 TOFU: recorded unconditionally (cheap), consumed only for
         # jobs actually defined with blake3=None (see tofu.py).
         self._call_site = _record_call_site()
-        self.retain = retain if retain is not None else Retain.Default
+        self.retain = _resolve_retain(retain)
         self.store = store
         python_env = graph.default_python
         if python_env is None:
@@ -1167,7 +1176,7 @@ class UnsandboxedJob(Job):
         self.inputs = dict(inputs or {})
         self.env = dict(env or {})
         self.resources = resources.pools if isinstance(resources, Resources) else {}
-        self.retain = retain if retain is not None else Retain.Default
+        self.retain = _resolve_retain(retain)
         self._recipe = recipe.recipe_hash(run)
         self._register()
         warnings.warn(

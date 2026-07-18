@@ -320,6 +320,61 @@ fn roots_registered_in_every_store_a_spec_links_into() {
 }
 
 #[test]
+fn readonly_store_entries_link_without_root_registration() {
+    // PPG3_DESIGN.md §4.1: a readonly store is a shared/mirror cache a run
+    // may hit but never writes — including its roots/ dir. A generation
+    // linking from one must still be writable (and droppable) without ever
+    // touching the readonly store.
+    let ro_dir = tempfile::tempdir().unwrap();
+    let rw_dir = tempfile::tempdir().unwrap();
+    let seed = Store::open("shared", ro_dir.path(), false).unwrap();
+    let oh_ro = publish_one(&seed, "ro1", "a.txt", b"from shared cache");
+    drop(seed);
+    let shared = Store::open("shared", ro_dir.path(), true).unwrap();
+    let local = Store::open("local", rw_dir.path(), false).unwrap();
+    let oh_rw = publish_one(&local, "rw1", "b.txt", b"local");
+
+    let stores = StoreSet::new(vec![local, shared]);
+    let project = tempfile::tempdir().unwrap();
+    let project_dir = project.path().join(".ppg3");
+
+    let spec = ViewSpec {
+        entries: vec![
+            ViewEntry {
+                view_rel_path: "local.txt".to_string(),
+                oh: oh_rw.clone(),
+                path_within_entry: "b.txt".to_string(),
+                store_index: 0,
+            },
+            ViewEntry {
+                view_rel_path: "shared.txt".to_string(),
+                oh: oh_ro,
+                path_within_entry: "a.txt".to_string(),
+                store_index: 1,
+            },
+        ],
+    };
+    let n = views::write_generation(&project_dir, "ro-proj", &stores, &spec, false).unwrap();
+
+    let gen_dir = project_dir.join("views").join(n.to_string());
+    assert_eq!(
+        std::fs::read_to_string(gen_dir.join("shared.txt")).unwrap(),
+        "from shared cache"
+    );
+    assert_eq!(roots_dir_entries(rw_dir.path(), "ro-proj", n), vec![oh_rw]);
+    assert!(roots_dir_entries(ro_dir.path(), "ro-proj", n).is_empty());
+
+    // A newer generation so `n` is no longer current, then drop it: the
+    // readonly store must not be touched (remove_root would error).
+    let spec2 = ViewSpec {
+        entries: vec![spec.entries[0].clone()],
+    };
+    views::write_generation(&project_dir, "ro-proj", &stores, &spec2, false).unwrap();
+    views::drop_generation(&project_dir, &stores, n).unwrap();
+    assert!(!gen_dir.exists());
+}
+
+#[test]
 fn drop_generation_unregisters_roots_and_removes_dir() {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Store::open("s", store_dir.path(), false).unwrap();

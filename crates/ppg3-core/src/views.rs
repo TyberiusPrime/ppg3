@@ -427,6 +427,13 @@ pub fn write_generation_with_vcs(
         }
     }
     for (idx, ohs) in &by_store {
+        // Readonly stores (PPG3_DESIGN.md §4.1: shared/mirror caches a run
+        // may *hit* but never writes) get no root registration: `store gc`
+        // skips readonly stores entirely, so a root there could never be
+        // consulted — their retention is their owner's business.
+        if stores.stores[*idx].is_readonly() {
+            continue;
+        }
         stores.stores[*idx].add_root(project_id, n, ohs)?;
     }
 
@@ -578,6 +585,11 @@ pub fn drop_generation(
                      provided StoreSet; cannot unregister its roots"
                 ))
             })?;
+        // Mirror of write_generation's skip: no roots were ever registered
+        // in a readonly store, so there is nothing to unregister.
+        if store.is_readonly() {
+            continue;
+        }
         store.remove_root(&meta.project_id, generation)?;
     }
 

@@ -102,6 +102,12 @@ python -m ppg3 webwatch pipeline.py --host 0.0.0.0   # careful: exposes it beyon
 
 The page live-updates (no reloading) and shows:
 
+- a **current run** panel while jobs execute: a progress meter, each
+  running job with its elapsed time, and — the important part — any job
+  that fails appears there **the moment it fails**, with its exception
+  summary, exit code, failure-log path and staged-output path, while the
+  rest of the run keeps going. No more waiting for a long run to finish
+  before finding out what broke;
 - what the watcher is doing right now (running a pass / waiting for
   changes), the watched-path set, and total run/failure counts;
 - a history of recent passes — which paths triggered each one, how long it
@@ -109,6 +115,11 @@ The page live-updates (no reloading) and shows:
 - for failed runs, a per-job drill-down: the exception summary, runtime,
   exit code, the failure-log and staged-output paths to inspect, and the
   full error report; for a broken pipeline script, the Python traceback.
+
+Under the hood the scheduler writes a small JSONL event log per run
+(`.ppg3/run-events-*.jsonl`, one line per job start/finish/failure) and
+webwatch tails it — the same file is there for your own tooling to watch,
+with or without the web page.
 
 There is also `GET /api/state` (the same data as JSON) if you want to
 script against it. The basic `watch` command is unaffected — use whichever

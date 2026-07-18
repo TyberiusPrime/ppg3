@@ -14,6 +14,7 @@ import json
 import re
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 from ._bridge import get_core
@@ -695,6 +696,11 @@ _last_run_info: Dict[str, Any] = {
     "watched_paths": [],
     "generation": None,
     "report": None,
+    # Path of the current/most-recent run's JSONL event log (see the
+    # events-path block in `run()`). Unlike every other slot here it is
+    # set *before* `_core.run` starts, so a live observer (webwatch's
+    # tailer) can follow the run while jobs are still executing.
+    "events_path": None,
 }
 
 
@@ -814,7 +820,27 @@ def run(
     # session so templates stay warm across run() calls in this process
     # (watch iterations, repl). run(session=...) makes the Rust side use
     # the session's TemplateManager instead of a run-scoped one.
-    session = _get_session(core) if use_forkserver else None
+    session = _get_session(core) if graph.forkserver else None
+
+    # Webwatch phase 2 (STATUS.md): a per-run JSONL event log the scheduler
+    # writes live per-job progress into (best-effort — see the Rust
+    # `EventLog` doc). The path is unique per run so a tailer never has to
+    # handle in-place truncation; the previous run's file is unlinked so
+    # `.ppg3/` holds at most the latest one (an already-open tailer fd
+    # keeps working — POSIX unlink). Recorded in the "last run info" slot
+    # *before* the run starts, so a live observer can pick it up while
+    # jobs are still executing.
+    events_path = os.path.join(
+        os.path.abspath(graph.project_dir), f"run-events-{time.time_ns():x}.jsonl"
+    )
+    prev_events = _last_run_info.get("events_path")
+    _last_run_info["events_path"] = events_path
+    if prev_events and prev_events != events_path:
+        try:
+            os.unlink(prev_events)
+        except OSError:
+            pass
+
     report_json = core.run(
         handle,
         jobs_json,
@@ -824,6 +850,7 @@ def run(
         template_argv,
         session,
         graph.sandbox,
+        events_path,
     )
     report = json.loads(report_json)
 

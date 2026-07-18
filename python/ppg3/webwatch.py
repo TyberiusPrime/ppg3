@@ -23,24 +23,34 @@ page (no build step, ships inside the wheel). The server binds
 Full-snapshot SSE messages (rather than deltas) are deliberate: the state
 is small (run history is bounded at ``_HISTORY_LIMIT``), reconnects are
 trivially correct, and a stalled client can simply have intermediate
-snapshots dropped (`_broadcast_locked`) with no resync protocol. Phase 2
-(browsing previous generations of an output path, live per-job progress)
-is planned to work by tailing a runner-written event log in ``.ppg3/`` —
-the :data:`ppg3.watch.WatchEvent` dicts consumed here are already
-JSON-serializable with that in mind.
+snapshots dropped (`_broadcast_locked`) with no resync protocol.
+
+Phase 2 — live per-job progress ("what is going on *right now*, dig into
+failures immediately, not after a multi-hour run"): the Rust scheduler
+appends a best-effort JSONL event log per run (``run-events-<ts>.jsonl``
+in the project dir; see the Rust ``scheduler::EventLog`` doc for the
+vocabulary), ``ppg3.run()`` records its path in the last-run-info slot
+*before* the run starts, and :class:`EventLogTailer` here polls the file
+(same polling deviation, and for the same no-deps reason, as
+``watch.PollingWatcher``) and folds the events into the snapshot's
+``live`` section. Each run gets a fresh, uniquely-named file, so the
+tailer never has to handle in-place truncation — a path change *is* the
+run boundary signal, with the in-band ``run_started`` event as a second,
+redundant one.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, IO, List, Optional, Sequence
+from typing import Any, Callable, Dict, IO, List, Optional, Sequence
 
-from .run import _last_meaningful_line
+from .run import _last_meaningful_line, get_last_run_info
 from .watch import WatchEvent, _print, _timestamp, run_watch
 
 # Bounded per-pass history kept in memory (and shipped in every snapshot).
@@ -59,6 +69,23 @@ def _counts(report: Optional[Dict[str, Any]]) -> Optional[Dict[str, int]]:
         "built": len(report.get("built", [])),
         "hits": len(report.get("hits", [])),
         "failed": len(report.get("failed", {})),
+    }
+
+
+def _empty_live() -> Dict[str, Any]:
+    """A fresh ``live`` section: per-job state of the run currently (or
+    most recently) executing, built purely from the scheduler's event log
+    — independent of (and earlier than) the pass-level run history."""
+    return {
+        "run_id": None,
+        "total": 0,
+        "finished": False,
+        "counts": {"done": 0, "failed": 0, "running": 0, "pending": 0},
+        # job id -> {"status": "running"|"done"|"failed", "outcome",
+        # "started_ms", "runtime_ms", and for failures: "reason",
+        # "exception", "log", "out_dir", "exit_code"}.
+        "jobs": {},
+        "updated_ms": None,
     }
 
 
@@ -117,6 +144,7 @@ class WatchState:
             "n_runs": 0,
             "n_failures": 0,
             "runs": [],  # newest first, bounded at history_limit
+            "live": _empty_live(),
         }
 
     # ------------------------------------------------------------- events
@@ -171,6 +199,79 @@ class WatchState:
                 self._state["status"] = "stopped"
             # Unknown event types are recorded nowhere but still broadcast
             # a fresh snapshot — harmless either way.
+            self._broadcast_locked()
+
+    def handle_runner_events(self, events: List[Dict[str, Any]]) -> None:
+        """Fold a batch of scheduler event-log lines (see the Rust
+        ``EventLog`` vocabulary) into the ``live`` section. Batched on
+        purpose: the tailer hands over everything one poll read, so a
+        thousand-job burst is one lock acquisition and one SSE broadcast,
+        not a thousand."""
+        if not events:
+            return
+        with self._lock:
+            live = self._state["live"]
+            for event in events:
+                etype = event.get("type")
+                ts = event.get("ts_ms")
+                if etype == "run_started":
+                    live = _empty_live()
+                    live["run_id"] = event.get("run_id")
+                    live["total"] = int(event.get("total") or 0)
+                    self._state["live"] = live
+                elif etype == "job_started":
+                    live["jobs"][event.get("job")] = {
+                        "status": "running",
+                        "outcome": None,
+                        "started_ms": ts,
+                        "runtime_ms": None,
+                    }
+                elif etype == "job_finished":
+                    job = live["jobs"].setdefault(
+                        event.get("job"),
+                        {"status": None, "outcome": None, "started_ms": None, "runtime_ms": None},
+                    )
+                    job["status"] = "done"
+                    job["outcome"] = event.get("outcome")
+                    if job.get("started_ms") is not None and ts is not None:
+                        job["runtime_ms"] = ts - job["started_ms"]
+                    if event.get("total"):
+                        live["total"] = max(live["total"], int(event["total"]))
+                elif etype == "job_failed":
+                    detail = event.get("detail") or {}
+                    reason = detail.get("reason") or event.get("reason") or ""
+                    job = live["jobs"].setdefault(
+                        event.get("job"),
+                        {"status": None, "outcome": None, "started_ms": None, "runtime_ms": None},
+                    )
+                    job["status"] = "failed"
+                    job["reason"] = reason
+                    job["exception"] = _last_meaningful_line(reason)
+                    job["log"] = detail.get("failure_log") or detail.get("log_dir")
+                    job["out_dir"] = detail.get("out_dir")
+                    job["exit_code"] = detail.get("exit_code")
+                    if detail.get("runtime_ms") is not None:
+                        job["runtime_ms"] = detail["runtime_ms"]
+                    elif job.get("started_ms") is not None and ts is not None:
+                        job["runtime_ms"] = ts - job["started_ms"]
+                    if event.get("total"):
+                        live["total"] = max(live["total"], int(event["total"]))
+                elif etype == "run_finished":
+                    live["finished"] = True
+                if ts is not None:
+                    live["updated_ms"] = ts
+
+            statuses = [j.get("status") for j in live["jobs"].values()]
+            running = statuses.count("running")
+            failed = statuses.count("failed")
+            done = statuses.count("done")
+            live["total"] = max(live["total"], len(live["jobs"]))
+            live["counts"] = {
+                "done": done,
+                "failed": failed,
+                "running": running,
+                "pending": max(live["total"] - done - failed - running, 0),
+            }
             self._broadcast_locked()
 
     def _finish_run(self, event: WatchEvent, status: str, **fields: Any) -> None:
@@ -228,6 +329,94 @@ class WatchState:
                 self._subscribers.remove(q)
             except ValueError:
                 pass
+
+
+def _default_events_path() -> Optional[str]:
+    """Where the scheduler is writing (or last wrote) its event log —
+    ``ppg3.run()`` records this *before* the run starts, precisely so this
+    tailer can follow a run in progress."""
+    return get_last_run_info().get("events_path")
+
+
+class EventLogTailer(threading.Thread):
+    """Polls the scheduler's per-run JSONL event log and feeds parsed
+    events into :meth:`WatchState.handle_runner_events`, one batch per
+    poll.
+
+    Robustness properties (all covered by tests):
+
+    - The path is re-read from ``path_provider`` every poll; a *changed*
+      path (each run gets a unique file) drops the old file handle and
+      buffer and starts fresh — no in-place-truncation races by design.
+    - A missing/unopenable file is simply retried next poll (the run may
+      not have started yet).
+    - A torn final line (the scheduler flushes per event, but a poll can
+      still land mid-write) stays in the buffer until its newline arrives;
+      a malformed line is skipped, never fatal.
+    """
+
+    def __init__(
+        self,
+        state: WatchState,
+        path_provider: Optional[Callable[[], Optional[str]]] = None,
+        poll: float = 0.15,
+    ):
+        super().__init__(name="ppg3-webwatch-tailer", daemon=True)
+        self._state = state
+        self._path_provider = path_provider or _default_events_path
+        self._poll = poll
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        path: Optional[str] = None
+        fh = None
+        buf = b""
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    new_path = self._path_provider()
+                except Exception:
+                    new_path = None
+                if new_path != path:
+                    if fh is not None:
+                        fh.close()
+                        fh = None
+                    path = new_path
+                    buf = b""
+                if path is not None and fh is None:
+                    try:
+                        fh = open(path, "rb")
+                    except OSError:
+                        fh = None
+                if fh is not None:
+                    try:
+                        chunk = fh.read()
+                    except OSError:
+                        fh.close()
+                        fh = None
+                        chunk = b""
+                    if chunk:
+                        buf += chunk
+                        lines = buf.split(b"\n")
+                        buf = lines.pop()  # torn/incomplete final line
+                        events = []
+                        for line in lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                events.append(json.loads(line))
+                            except ValueError:
+                                continue
+                        if events:
+                            self._state.handle_runner_events(events)
+                self._stop_event.wait(self._poll)
+        finally:
+            if fh is not None:
+                fh.close()
 
 
 class _WebWatchServer(ThreadingHTTPServer):
@@ -325,12 +514,13 @@ def run_webwatch(
 ) -> int:
     """``python -m ppg3 webwatch <script> [args...]``: `run_watch` with the
     HTTP status frontend attached. Same loop, same console output, same
-    clean-SIGINT exit (returns 0); the server dies with the loop."""
-    import os
-
+    clean-SIGINT exit (returns 0); the server and the event-log tailer die
+    with the loop."""
     stream = stream or sys.stdout
     state = WatchState(os.path.abspath(script), interval)
     server = start_server(state, host, port)
+    tailer = EventLogTailer(state)
+    tailer.start()
     shown_host, shown_port = server.server_address[:2]
     _print(
         stream,
@@ -345,6 +535,7 @@ def run_webwatch(
             on_event=state.handle_event,
         )
     finally:
+        tailer.stop()
         server.shutdown()
         server.server_close()
 
@@ -436,6 +627,25 @@ _PAGE_HTML = """<!DOCTYPE html>
   ul.paths { margin: .2rem 0; padding-left: 1.2rem; font-size: .8rem; }
   ul.paths li { word-break: break-all; }
   .empty { color: var(--muted); font-style: italic; padding: 1.5rem 0; }
+  .livebox { border: 1px solid var(--line); border-radius: 8px; background: var(--card);
+             padding: .7rem .8rem 0.8rem; margin-bottom: 1rem; }
+  .livebox h2 { margin: 0 0 .4rem; font-size: .82rem; text-transform: uppercase;
+                letter-spacing: .05em; color: var(--muted);
+                display: flex; gap: .6rem; align-items: baseline; }
+  .livebox .runid { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .meter { display: flex; gap: 2px; height: 10px; border-radius: 4px;
+           overflow: hidden; margin: .35rem 0 .3rem; }
+  .meter .seg { min-width: 3px; }
+  .meter .seg.done    { background: var(--ok); }
+  .meter .seg.failed  { background: var(--failed); }
+  .meter .seg.running { background: var(--running); animation: pulse 1.2s ease-in-out infinite; }
+  .meter .seg.pending { background: var(--line); }
+  .livecounts { color: var(--muted); font-size: .82rem; }
+  .livecounts b { color: var(--fg); font-weight: 600; }
+  .livecounts .fc { color: var(--failed); font-weight: 600; }
+  .liverow { display: flex; gap: .8rem; align-items: baseline; font-size: .85rem;
+             padding: .15rem 0; }
+  .liverow .elapsed { color: var(--muted); font-size: .8rem; }
 </style>
 </head>
 <body>
@@ -453,6 +663,7 @@ _PAGE_HTML = """<!DOCTYPE html>
     </details>
     <span id="conn">connecting&hellip;</span>
   </div>
+  <div id="livebox"></div>
   <div class="runs" id="runs"><div class="empty">no runs yet</div></div>
 </div>
 <script>
@@ -461,7 +672,9 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const expanded = new Set();   // run numbers whose <details> are open
+const subsOpen = new Set();   // data-key values of open details.sub elements
 let watchedOpen = false;
+let lastState = null;
 
 function fmtTime(ts) {
   return ts ? new Date(ts * 1000).toLocaleTimeString() : "";
@@ -474,7 +687,12 @@ function fmtDur(ms) {
   return Math.floor(s / 60) + "m" + Math.round(s % 60) + "s";
 }
 
-function failureHtml(f) {
+function sub(key, summary, inner) {
+  return `<details class="sub" data-key="${esc(key)}"${subsOpen.has(key) ? " open" : ""}>` +
+         `<summary>${summary}</summary>${inner}</details>`;
+}
+
+function failureHtml(f, keyPrefix) {
   const meta = [];
   if (f.runtime_ms != null) meta.push("runtime " + fmtDur(f.runtime_ms));
   if (f.exit_code != null) meta.push("exit " + esc(f.exit_code));
@@ -486,8 +704,48 @@ function failureHtml(f) {
     ${f.log ? `<div class="path">log: <span class="mono">${esc(f.log)}</span></div>` : ""}
     ${f.out_dir ? `<div class="path">outputs: <span class="mono">${esc(f.out_dir)}</span></div>` : ""}
     ${f.reason && f.reason.trim() !== (f.exception || "").trim()
-      ? `<details class="sub"><summary>full reason</summary><pre>${esc(f.reason)}</pre></details>`
+      ? sub(`${keyPrefix}:${f.job}:reason`, "full reason", `<pre>${esc(f.reason)}</pre>`)
       : ""}
+  </div>`;
+}
+
+function liveHtml(live) {
+  const jobs = Object.entries(live.jobs || {}).map(([id, j]) => ({job: id, ...j}));
+  if (!live.total && !jobs.length) return "";
+  const c = live.counts;
+  const seg = (n, cls) =>
+    n > 0 ? `<div class="seg ${cls}" style="flex:${n} 1 0"></div>` : "";
+  const failed = jobs.filter(j => j.status === "failed");
+  const running = jobs.filter(j => j.status === "running");
+  const done = jobs.filter(j => j.status === "done");
+  const runningRows = running.map(j => `<div class="liverow">
+      <span class="badge running">running</span>
+      <span class="mono">${esc(j.job)}</span>
+      <span class="elapsed">${j.started_ms ? fmtDur(Math.max(Date.now() - j.started_ms, 0)) : ""}</span>
+    </div>`).join("");
+  const doneRows = done.map(j => `<div class="liverow">
+      <span class="badge ok">${esc(j.outcome || "done")}</span>
+      <span class="mono">${esc(j.job)}</span>
+      <span class="elapsed">${fmtDur(j.runtime_ms)}</span>
+    </div>`).join("");
+  return `<div class="livebox">
+    <h2>current run
+      <span class="runid mono">${esc(live.run_id || "")}</span>
+      <span class="badge ${live.finished ? (c.failed ? "failed" : "ok") : "running"}">
+        ${live.finished ? "finished" : "running"}</span>
+    </h2>
+    <div class="livecounts">
+      <b>${c.done}</b> done &middot;
+      <span class="${c.failed ? "fc" : ""}">${c.failed} failed</span> &middot;
+      ${c.running} running &middot; ${c.pending} pending &middot; ${live.total} total
+    </div>
+    <div class="meter" role="img"
+      aria-label="${c.done} done, ${c.failed} failed, ${c.running} running, ${c.pending} pending of ${live.total}">
+      ${seg(c.done, "done")}${seg(c.failed, "failed")}${seg(c.running, "running")}${seg(c.pending, "pending")}
+    </div>
+    ${failed.map(f => failureHtml(f, "live")).join("")}
+    ${runningRows}
+    ${done.length ? sub("live:done", `${done.length} finished job(s)`, doneRows) : ""}
   </div>`;
 }
 
@@ -514,7 +772,7 @@ function runHtml(r) {
       ${changed ? `<h3>changed paths</h3><ul class="paths mono">${changed}</ul>` : ""}
       ${r.failures && r.failures.length
         ? `<h3>${r.failures.length} failed job(s) — view left unchanged</h3>` +
-          r.failures.map(failureHtml).join("")
+          r.failures.map(f => failureHtml(f, `run${r.n}`)).join("")
         : ""}
       ${r.traceback
         ? `<h3>definition pass traceback</h3><pre>${esc(r.traceback)}</pre>` : ""}
@@ -526,6 +784,7 @@ function runHtml(r) {
 }
 
 function render(state) {
+  lastState = state;
   const st = $("status");
   st.textContent = state.status;
   st.className = "badge " + state.status;
@@ -538,6 +797,7 @@ function render(state) {
   $("watched").innerHTML =
     state.watched_paths.map(p => `<li>${esc(p)}</li>`).join("");
   $("watchedbox").open = watchedOpen;
+  $("livebox").innerHTML = state.live ? liveHtml(state.live) : "";
   $("runs").innerHTML = state.runs.length
     ? state.runs.map(runHtml).join("")
     : '<div class="empty">no runs yet</div>';
@@ -549,8 +809,20 @@ document.addEventListener("toggle", ev => {
   if (el.classList && el.classList.contains("run")) {
     const n = Number(el.dataset.n);
     if (el.open) expanded.add(n); else expanded.delete(n);
+    return;
+  }
+  if (el.dataset && el.dataset.key) {
+    if (el.open) subsOpen.add(el.dataset.key); else subsOpen.delete(el.dataset.key);
   }
 }, true);
+
+// Tick the elapsed time of in-flight jobs between SSE snapshots.
+setInterval(() => {
+  if (lastState && lastState.live && !lastState.live.finished &&
+      lastState.live.counts.running > 0) {
+    render(lastState);
+  }
+}, 1000);
 
 const es = new EventSource("/api/events");
 es.addEventListener("state", ev => {

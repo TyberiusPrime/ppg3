@@ -500,3 +500,353 @@ def test_e2e_webwatch_serves_state_over_http_and_clean_sigint(tmp_path):
             proc.kill()
             proc.wait(timeout=5)
         reader.join(timeout=5)
+
+
+# --------------------------------------------------------------------------
+# Phase 2: live per-job state from the scheduler's JSONL event log.
+# --------------------------------------------------------------------------
+
+
+def _runner(etype, **fields):
+    return {"type": etype, "ts_ms": fields.pop("ts_ms", 1000), **fields}
+
+
+def test_live_state_full_run_lifecycle():
+    state = WatchState("p.py", 0.5)
+    state.handle_runner_events(
+        [
+            _runner("run_started", run_id="run-1-abc", total=3, ts_ms=1000),
+            _runner("job_started", job="a", ts_ms=1010),
+            _runner("job_started", job="b", ts_ms=1010),
+        ]
+    )
+    live = _state_dict(state)["live"]
+    assert live["run_id"] == "run-1-abc"
+    assert live["total"] == 3
+    assert live["counts"] == {"done": 0, "failed": 0, "running": 2, "pending": 1}
+    assert live["jobs"]["a"]["status"] == "running"
+
+    state.handle_runner_events(
+        [
+            _runner("job_finished", job="a", outcome="built", total=3, ts_ms=1500),
+            _runner("job_finished", job="b", outcome="hit", total=3, ts_ms=1600),
+            _runner("job_started", job="c", ts_ms=1600),
+            _runner("job_finished", job="c", outcome="built", total=3, ts_ms=1900),
+            _runner("run_finished", built=2, hits=1, failed=0, ts_ms=1900),
+        ]
+    )
+    live = _state_dict(state)["live"]
+    assert live["finished"] is True
+    assert live["counts"] == {"done": 3, "failed": 0, "running": 0, "pending": 0}
+    assert live["jobs"]["a"]["runtime_ms"] == 490
+    assert live["jobs"]["b"]["outcome"] == "hit"
+
+
+def test_live_state_failure_carries_detail_immediately():
+    state = WatchState("p.py", 0.5)
+    state.handle_runner_events(
+        [
+            _runner("run_started", run_id="r", total=2, ts_ms=1),
+            _runner("job_started", job="boom", ts_ms=2),
+            _runner(
+                "job_failed",
+                job="boom",
+                reason='job "boom" exited with code 2\n--- stderr tail ---\nkapow',
+                detail={
+                    "reason": 'job "boom" exited with code 2\n--- stderr tail ---\nkapow',
+                    "failure_log": "/logs/boom/failure.log",
+                    "exit_code": 2,
+                    "runtime_ms": 17,
+                    "out_dir": "/staging/x/data",
+                    "log_dir": "/logs/boom",
+                },
+                total=2,
+                ts_ms=20,
+            ),
+            # Cascade failure: bare detail, never started.
+            _runner(
+                "job_failed",
+                job="downstream",
+                reason="upstream failed: boom",
+                detail={"reason": "upstream failed: boom"},
+                total=2,
+                ts_ms=21,
+            ),
+        ]
+    )
+    live = _state_dict(state)["live"]
+    assert live["counts"] == {"done": 0, "failed": 2, "running": 0, "pending": 0}
+    boom = live["jobs"]["boom"]
+    assert boom["status"] == "failed"
+    assert boom["exception"] == "kapow"
+    assert boom["log"] == "/logs/boom/failure.log"
+    assert boom["out_dir"] == "/staging/x/data"
+    assert boom["exit_code"] == 2
+    assert boom["runtime_ms"] == 17
+    down = live["jobs"]["downstream"]
+    assert down["status"] == "failed"
+    assert down["reason"] == "upstream failed: boom"
+
+
+def test_live_state_new_run_resets():
+    state = WatchState("p.py", 0.5)
+    state.handle_runner_events(
+        [
+            _runner("run_started", run_id="r1", total=1, ts_ms=1),
+            _runner("job_started", job="a", ts_ms=2),
+            _runner("job_failed", job="a", reason="x", detail={"reason": "x"}, total=1, ts_ms=3),
+            _runner("run_finished", built=0, hits=0, failed=1, ts_ms=3),
+            _runner("run_started", run_id="r2", total=1, ts_ms=10),
+            _runner("job_started", job="a", ts_ms=11),
+        ]
+    )
+    live = _state_dict(state)["live"]
+    assert live["run_id"] == "r2"
+    assert live["finished"] is False
+    assert live["jobs"]["a"]["status"] == "running"
+    assert live["counts"]["failed"] == 0
+
+
+def test_live_state_graph_expansion_grows_total():
+    state = WatchState("p.py", 0.5)
+    state.handle_runner_events(
+        [
+            _runner("run_started", run_id="r", total=1, ts_ms=1),
+            _runner("job_started", job="expander", ts_ms=2),
+            _runner("job_finished", job="expander", outcome="graph_expanded", total=3, ts_ms=3),
+        ]
+    )
+    live = _state_dict(state)["live"]
+    assert live["total"] == 3
+    assert live["counts"]["pending"] == 2
+
+
+# --------------------------------------------------------------------------
+# EventLogTailer (no _core): real files, injected path provider.
+# --------------------------------------------------------------------------
+
+
+def _wait_for(predicate, deadline=5.0, poll=0.02, description="condition"):
+    start = time.monotonic()
+    while time.monotonic() - start < deadline:
+        if predicate():
+            return
+        time.sleep(poll)
+    raise AssertionError(f"timed out waiting for: {description}")
+
+
+def test_tailer_follows_appends_and_run_boundary_path_change(tmp_path):
+    from ppg3.webwatch import EventLogTailer
+
+    state = WatchState("p.py", 0.5)
+    log1 = tmp_path / "run-events-1.jsonl"
+    log1.write_text(
+        json.dumps({"type": "run_started", "run_id": "r1", "total": 1, "ts_ms": 1}) + "\n"
+    )
+    current = {"path": str(log1)}
+    tailer = EventLogTailer(state, path_provider=lambda: current["path"], poll=0.02)
+    tailer.start()
+    try:
+        _wait_for(
+            lambda: _state_dict(state)["live"]["run_id"] == "r1",
+            description="tailer picked up r1",
+        )
+
+        # Appends are picked up (including a torn write completed later,
+        # and a malformed line that must be skipped).
+        with open(log1, "a") as fh:
+            fh.write(json.dumps({"type": "job_started", "job": "a", "ts_ms": 2}) + "\n")
+            fh.write("{this is not json}\n")
+            fh.write('{"type": "job_finished", "job": "a", "outc')  # torn
+            fh.flush()
+        _wait_for(
+            lambda: _state_dict(state)["live"]["jobs"].get("a", {}).get("status")
+            == "running",
+            description="job a running via append",
+        )
+        with open(log1, "a") as fh:
+            fh.write('ome": "built", "total": 1, "ts_ms": 5}\n')  # completes the torn line
+        _wait_for(
+            lambda: _state_dict(state)["live"]["jobs"]["a"].get("status") == "done",
+            description="torn line completed and parsed",
+        )
+
+        # New run = new file; the path change alone must reset cleanly.
+        log2 = tmp_path / "run-events-2.jsonl"
+        log2.write_text(
+            json.dumps({"type": "run_started", "run_id": "r2", "total": 2, "ts_ms": 10}) + "\n"
+        )
+        current["path"] = str(log2)
+        _wait_for(
+            lambda: _state_dict(state)["live"]["run_id"] == "r2",
+            description="tailer switched to r2",
+        )
+        assert _state_dict(state)["live"]["jobs"] == {}
+    finally:
+        tailer.stop()
+        tailer.join(timeout=5)
+
+
+def test_tailer_tolerates_missing_file_until_it_appears(tmp_path):
+    from ppg3.webwatch import EventLogTailer
+
+    state = WatchState("p.py", 0.5)
+    log = tmp_path / "not-yet.jsonl"
+    tailer = EventLogTailer(state, path_provider=lambda: str(log), poll=0.02)
+    tailer.start()
+    try:
+        time.sleep(0.1)  # a few polls against the missing file: no crash
+        assert tailer.is_alive()
+        log.write_text(
+            json.dumps({"type": "run_started", "run_id": "late", "total": 0, "ts_ms": 1}) + "\n"
+        )
+        _wait_for(
+            lambda: _state_dict(state)["live"]["run_id"] == "late",
+            description="tailer picked up the late-appearing file",
+        )
+    finally:
+        tailer.stop()
+        tailer.join(timeout=5)
+
+
+def _write_live_pipeline_script(path):
+    """Two independent jobs: one fails immediately (nonzero exit), one
+    sleeps then writes into a *nested* view path without mkdir'ing it —
+    covering both the live failure-drill-down contract and the
+    scheduler-side view-path parent-dir creation, through the real
+    executor."""
+    sleep_bin = shutil.which("sleep") or "/bin/sleep"
+    cat_bin = shutil.which("cat") or "/bin/cat"
+    path.write_text(
+        "import sys\n"
+        "import ppg3\n"
+        "from ppg3.tools import PyEnv\n"
+        "\n"
+        "leaf_path, store_dir, project_dir, sleep_s = sys.argv[1:5]\n"
+        "g = ppg3.new(\n"
+        "    stores=[ppg3.Store('main', store_dir)],\n"
+        "    default_python=PyEnv.current(),\n"
+        "    project_dir=project_dir,\n"
+        "    frozen=False,\n"
+        "    paranoid=True,\n"
+        ")\n"
+        "ppg3.CommandJob(\n"
+        "    view={'out': 'results/failed.txt'},\n"
+        "    argv=['/bin/sh', '-c', 'echo doomed >&2; exit 3'],\n"
+        "    inputs={'leaf': ppg3.File(leaf_path)},\n"
+        ")\n"
+        "ppg3.CommandJob(\n"
+        "    view={'out': 'results/slow.txt'},\n"
+        f"    argv=['/bin/sh', '-c', '{sleep_bin} ' + sleep_s + ' && {cat_bin} ' + leaf_path + ' > {{out:out}}'],\n"
+        "    inputs={'leaf': ppg3.File(leaf_path)},\n"
+        ")\n"
+        "ppg3.run(g, project_id='webwatch-live-e2e')\n"
+    )
+
+
+@requires_core
+def test_e2e_webwatch_live_progress_and_immediate_failure(tmp_path):
+    script = tmp_path / "pipeline.py"
+    _write_live_pipeline_script(script)
+    leaf = tmp_path / "leaf.txt"
+    leaf.write_text("v1\n")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    project_dir = tmp_path / ".ppg3"
+
+    env = dict(os.environ)
+    python_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = python_dir + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "ppg3",
+            "webwatch",
+            str(script),
+            "--interval",
+            "0.1",
+            "--port",
+            "0",
+            str(leaf),
+            str(store_dir),
+            str(project_dir),
+            "4",  # slow job sleeps 4s: the window in which the fast failure must already be visible
+        ],
+        cwd=str(tmp_path),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout_lines: list[str] = []
+
+    def _drain_stdout():
+        for line in proc.stdout:
+            stdout_lines.append(line)
+
+    reader = threading.Thread(target=_drain_stdout, daemon=True)
+    reader.start()
+
+    def _base_url():
+        for line in stdout_lines:
+            m = re.search(r"serving on (http://127\.0\.0\.1:\d+)/", line)
+            if m:
+                return m.group(1)
+        return None
+
+    def _api_state():
+        with urllib.request.urlopen(_base_url() + "/api/state", timeout=5) as resp:
+            return json.loads(resp.read())
+
+    def _failed_visible_mid_run():
+        live = _api_state()["live"]
+        job = live["jobs"].get("results/failed.txt")
+        return (
+            job is not None
+            and job.get("status") == "failed"
+            and not live.get("finished")
+        )
+
+    try:
+        _wait_until(lambda: _base_url() is not None, description="serving line on stdout")
+        # THE phase-2 contract: the failed job (detail included) is visible
+        # over HTTP while the run is still executing the slow sibling.
+        _wait_until(_failed_visible_mid_run, description="failure visible mid-run")
+        live = _api_state()["live"]
+        failed_job = live["jobs"]["results/failed.txt"]
+        assert failed_job["exit_code"] == 3
+        assert failed_job["log"], "failure log path must be available immediately"
+        assert "doomed" in (failed_job["reason"] or "")
+        assert live["total"] == 2
+
+        # The slow sibling finishes (its nested `results/` view path is
+        # auto-created by the scheduler now — no job-side mkdir), then the
+        # run ends failed and the pass lands in the run history.
+        _wait_until(
+            lambda: _api_state()["live"].get("finished") is True,
+            description="run_finished in live state",
+        )
+        live = _api_state()["live"]
+        assert live["jobs"]["results/slow.txt"]["status"] == "done"
+        assert live["counts"] == {"done": 1, "failed": 1, "running": 0, "pending": 0}
+        _wait_until(
+            lambda: any(r["status"] == "failed" for r in _api_state()["runs"]),
+            description="failed pass in run history",
+        )
+
+        proc.send_signal(signal.SIGINT)
+        try:
+            returncode = proc.wait(timeout=_DEADLINE)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError("process did not exit within deadline after SIGINT")
+        assert returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        reader.join(timeout=5)

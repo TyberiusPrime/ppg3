@@ -34,6 +34,7 @@
 //! subgraphs continue" true even when a job hits a store-level hard error.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -171,6 +172,58 @@ pub struct FailedJob {
     pub missing_outputs: Vec<String>,
 }
 
+/// Best-effort structured run-event log: one JSON object per line (JSONL),
+/// written as the run progresses so an outside observer (`python -m ppg3
+/// webwatch`'s tailer, a future TUI) can show live per-job state instead of
+/// waiting for the final `RunReport`. Event vocabulary (every event carries
+/// `ts_ms`, unix milliseconds):
+///
+/// - `run_started`: `run_id`, `total` (job count at start)
+/// - `job_started`: `job` (dispatched to a worker)
+/// - `job_finished`: `job`, `outcome` (`"built"`/`"hit"`/`"inprocess"`/
+///   `"graph_expanded"`), `total` (current job count — grows on expansion)
+/// - `job_failed`: `job`, `reason`, `detail` (the [`FailedJob`], present
+///   for upstream-cascade failures too), `total`
+/// - `run_finished`: `built`, `hits`, `failed` (final counts)
+///
+/// Deliberately best-effort everywhere: an unopenable path or a failed
+/// write must never fail (or even slow) the run itself — the authoritative
+/// record is still the returned `RunReport`. The file is created fresh per
+/// run (callers pass a unique per-run path precisely so a tailer never has
+/// to handle in-place truncation).
+struct EventLog {
+    file: std::fs::File,
+}
+
+impl EventLog {
+    fn open(path: &Path) -> Option<EventLog> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::File::create(path).ok().map(|file| EventLog { file })
+    }
+
+    fn emit(&mut self, mut event: Value) {
+        if let Some(obj) = event.as_object_mut() {
+            obj.insert("ts_ms".to_string(), Value::from(now_ms()));
+        }
+        if let Ok(mut line) = serde_json::to_string(&event) {
+            line.push('\n');
+            let _ = self.file.write_all(line.as_bytes());
+            let _ = self.file.flush();
+        }
+    }
+}
+
+/// Emit onto `state`'s event log, if the run has one. Takes `&mut State`
+/// (callers already hold the state lock at every transition point), so
+/// writes are naturally serialized without a second mutex.
+fn emit_event(state: &mut State, event: Value) {
+    if let Some(log) = state.event_log.as_mut() {
+        log.emit(event);
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunReport {
     pub built: Vec<String>,
@@ -196,6 +249,23 @@ pub fn run(
     parallelism: &BTreeMap<String, u64>,
     abort: &AtomicBool,
 ) -> Result<RunReport> {
+    run_with_event_log(storeset, executor, jobs, callbacks, parallelism, abort, None)
+}
+
+/// [`run`] plus an optional [`EventLog`] path (additive, same pattern as
+/// `views::write_generation_with_vcs` — the original entry point keeps its
+/// signature and delegates here). When given, per-job progress events are
+/// appended to `event_log` as JSONL while the run executes; see
+/// [`EventLog`] for the vocabulary and the best-effort guarantees.
+pub fn run_with_event_log(
+    storeset: &StoreSet,
+    executor: &dyn Executor,
+    jobs: Vec<JobDef>,
+    callbacks: &dyn HostCallbacks,
+    parallelism: &BTreeMap<String, u64>,
+    abort: &AtomicBool,
+    event_log: Option<&Path>,
+) -> Result<RunReport> {
     // error-stack renders `{:?}` with ANSI color when it thinks the sink is a
     // TTY; our Reports go into `failure.log` files and JSON report strings, so
     // force plain text globally (idempotent, cheap to set each run).
@@ -205,6 +275,7 @@ pub fn run(
     validate_and_index(&jobs, &HashMap::new(), &pools_cap)?;
 
     let mut state = State::new();
+    state.event_log = event_log.and_then(EventLog::open);
     for job in jobs {
         insert_job(&mut state, job);
     }
@@ -213,6 +284,15 @@ pub fn run(
     let worker_count = parallelism.get("workers").copied().unwrap_or(4).max(1) as usize;
 
     let run_id = generate_run_id();
+    let total = state.total_jobs;
+    emit_event(
+        &mut state,
+        serde_json::json!({
+            "type": "run_started",
+            "run_id": run_id,
+            "total": total,
+        }),
+    );
     // Best-effort: a run with no writable store configured (e.g. entirely
     // InProcess jobs, or a validate-only pass over readonly mirrors) should
     // not hard-fail just because there is nothing to lease. See STATUS.md.
@@ -238,7 +318,22 @@ pub fn run(
         }
     });
 
-    Ok(shared.state.into_inner().unwrap().report)
+    let mut state = shared.state.into_inner().unwrap();
+    let (built, hits, failed) = (
+        state.report.built.len(),
+        state.report.hits.len(),
+        state.report.failed.len(),
+    );
+    emit_event(
+        &mut state,
+        serde_json::json!({
+            "type": "run_finished",
+            "built": built,
+            "hits": hits,
+            "failed": failed,
+        }),
+    );
+    Ok(state.report)
 }
 
 fn pool_capacities(parallelism: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
@@ -420,6 +515,9 @@ struct State {
     total_jobs: usize,
     running: usize,
     terminal: usize,
+    /// Live progress sink (see [`EventLog`]); `None` for callers of plain
+    /// [`run`]. Lives inside `State` so `fail_job`'s cascades can emit too.
+    event_log: Option<EventLog>,
 }
 
 impl State {
@@ -435,6 +533,7 @@ impl State {
             total_jobs: 0,
             running: 0,
             terminal: 0,
+            event_log: None,
         }
     }
 }
@@ -521,6 +620,17 @@ fn fail_job(state: &mut State, id: &str, reason: String, detail: Option<FailedJo
         reason: reason.clone(),
         ..FailedJob::default()
     });
+    let total = state.total_jobs;
+    emit_event(
+        state,
+        serde_json::json!({
+            "type": "job_failed",
+            "job": id,
+            "reason": reason.as_str(),
+            "detail": serde_json::to_value(&detail).unwrap_or(Value::Null),
+            "total": total,
+        }),
+    );
     state.report.failed.insert(id.to_string(), reason);
     state.report.failed_details.insert(id.to_string(), detail);
     state.terminal += 1;
@@ -567,6 +677,10 @@ fn worker_loop(shared: &Shared) {
         let id = guard.ready.pop_front().expect("checked non-empty above");
         guard.status.insert(id.clone(), Status::Running);
         guard.running += 1;
+        emit_event(
+            &mut guard,
+            serde_json::json!({"type": "job_started", "job": id.as_str()}),
+        );
         drop(guard);
 
         let outcome = dispatch_job(shared, &id);
@@ -703,6 +817,31 @@ fn dispatch_argv_job(
     // Captured for `FailedJob` before `out_dir` is moved into the
     // `PreparedJob` below — the staging dir survives a failure (postmortem).
     let out_dir_str = out_dir.display().to_string();
+
+    // Pre-create the parent directory of every declared output path, so a
+    // job with a nested view path (`view = {"out": "results/x.tsv"}` →
+    // `{out:out}` = `/ppg/out/results/x.tsv`) can write there directly
+    // instead of every job having to `mkdir -p` its own output parents — a
+    // consistent pitfall. Paths with `..` components are skipped (never
+    // create directories outside staging); such a path fails later anyway
+    // (publish hashes only what is *inside* `data/`).
+    for rel in job.view.values().chain(job.outputs_declared.iter()) {
+        let rel_path = std::path::Path::new(rel);
+        if rel_path.is_absolute()
+            || rel_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        if let Some(parent) = rel_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let dir = out_dir.join(parent);
+                std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+            }
+        }
+    }
+
     let log_dir = write_store.log_dir_for(ik)?;
 
     let mut input_mounts = Vec::new();
@@ -959,6 +1098,7 @@ fn apply_outcome(shared: &Shared, state: &mut State, id: &str, outcome: JobOutco
                 },
             );
             complete_success(state, id);
+            emit_finished(state, id, "hit");
         }
         JobOutcome::Built {
             ik,
@@ -983,10 +1123,12 @@ fn apply_outcome(shared: &Shared, state: &mut State, id: &str, outcome: JobOutco
                 },
             );
             complete_success(state, id);
+            emit_finished(state, id, "built");
         }
         JobOutcome::InProcessDone => {
             state.report.built.push(id.to_string());
             complete_success(state, id);
+            emit_finished(state, id, "inprocess");
         }
         JobOutcome::GraphExpanded(new_jobs) => {
             let pools_cap = shared.pools.capacities().clone();
@@ -997,6 +1139,7 @@ fn apply_outcome(shared: &Shared, state: &mut State, id: &str, outcome: JobOutco
                     }
                     state.report.built.push(id.to_string());
                     complete_success(state, id);
+                    emit_finished(state, id, "graph_expanded");
                 }
                 Err(e) => {
                     fail_job(state, id, format!("graph_job expansion invalid: {e}"), None);
@@ -1007,6 +1150,22 @@ fn apply_outcome(shared: &Shared, state: &mut State, id: &str, outcome: JobOutco
             fail_job(state, id, reason, detail);
         }
     }
+}
+
+/// `job_finished` success event (the failure counterpart is emitted inside
+/// `fail_job`, so cascades are covered there). `total` rides along on every
+/// event because a `GraphExpanded` outcome grows it mid-run.
+fn emit_finished(state: &mut State, id: &str, outcome: &str) {
+    let total = state.total_jobs;
+    emit_event(
+        state,
+        serde_json::json!({
+            "type": "job_finished",
+            "job": id,
+            "outcome": outcome,
+            "total": total,
+        }),
+    );
 }
 
 // ============================================================ key derivation

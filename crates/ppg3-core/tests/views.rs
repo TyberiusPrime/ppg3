@@ -896,3 +896,57 @@ fn generation_meta_json_has_expected_shape() {
     assert_eq!(meta.entries[0].oh, oh);
     assert_eq!(meta.entries[0].store_name, "s");
 }
+
+/// A `path_within_entry` naming a *directory* inside the entry (a job that
+/// produced a whole tree, e.g. `view = {"plots": "plots"}`) links the
+/// directory itself into the view — files inside are reachable through it.
+/// This works today because `write_generation` canonicalizes+symlinks any
+/// existing path without demanding a content-manifest key; this test pins
+/// the behavior on purpose (folder outputs are a real use case, verified
+/// end-to-end through `ppg3.run()` too — see STATUS.md "webwatch phase 2"
+/// notes).
+#[test]
+fn view_entry_may_link_a_directory_within_an_entry() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Store::open("s", store_dir.path(), false).unwrap();
+
+    // Publish an entry whose data/ holds a directory tree.
+    let ik = format!("{:0<64}", "dirtree");
+    let staging = store.open_staging().unwrap();
+    std::fs::create_dir_all(staging.path().join("plots/sub")).unwrap();
+    std::fs::write(staging.path().join("plots/a.txt"), b"one").unwrap();
+    std::fs::write(staging.path().join("plots/sub/b.txt"), b"two").unwrap();
+    let outcome = store
+        .publish(
+            staging,
+            &ik,
+            &serde_json::json!({"ppg3_key_version": 1, "seed": "dirtree"}),
+            built(),
+            None,
+        )
+        .unwrap();
+    let oh = outcome.oh().to_string();
+
+    let stores = StoreSet::new(vec![store]);
+    let project = tempfile::tempdir().unwrap();
+    let project_dir = project.path().join(".ppg3");
+
+    let spec = ViewSpec {
+        entries: vec![ViewEntry {
+            view_rel_path: "plots".to_string(),
+            oh,
+            path_within_entry: "plots".to_string(),
+            store_index: 0,
+        }],
+    };
+    let n = views::write_generation(&project_dir, "proj", &stores, &spec, false).unwrap();
+
+    let link = project_dir.join("views").join(n.to_string()).join("plots");
+    assert!(link.is_symlink());
+    assert!(link.is_dir(), "directory symlink must resolve");
+    assert_eq!(std::fs::read_to_string(link.join("a.txt")).unwrap(), "one");
+    assert_eq!(
+        std::fs::read_to_string(link.join("sub/b.txt")).unwrap(),
+        "two"
+    );
+}

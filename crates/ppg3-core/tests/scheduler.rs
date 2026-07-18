@@ -1450,3 +1450,259 @@ fn resource_serialization_pool_of_three_allows_all_to_run() {
     );
     assert_eq!(exec.total_invocations(), 3);
 }
+
+// ============================================================ event log
+
+/// Read back a JSONL event log as parsed values.
+fn read_events(path: &std::path::Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn events_of_type<'a>(events: &'a [Value], t: &str) -> Vec<&'a Value> {
+    events.iter().filter(|e| e["type"] == t).collect()
+}
+
+/// `run_with_event_log` writes the full JSONL vocabulary: one
+/// `run_started` (with the initial total), a `job_started` +
+/// `job_finished(outcome="built")` pair per job, and a final
+/// `run_finished` whose counts match the returned `RunReport`. Every
+/// event carries `ts_ms`.
+#[test]
+fn event_log_records_successful_diamond() {
+    let (_dir, storeset) = fresh_storeset();
+    let exec = MockExecutor::new();
+    configure_diamond_outputs(&exec);
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("events.jsonl");
+
+    let report = scheduler::run_with_event_log(
+        &storeset,
+        &exec,
+        diamond_jobs(),
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+        Some(&log_path),
+    )
+    .unwrap();
+    assert_eq!(report.built.len(), 4);
+
+    let events = read_events(&log_path);
+    assert!(events.iter().all(|e| e["ts_ms"].is_i64()), "every event carries ts_ms");
+
+    let started = events_of_type(&events, "run_started");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0]["total"], 4);
+    assert!(started[0]["run_id"].as_str().unwrap().starts_with("run-"));
+    assert_eq!(events[0]["type"], "run_started", "run_started must be the first line");
+
+    let job_started = events_of_type(&events, "job_started");
+    let mut started_jobs: Vec<&str> =
+        job_started.iter().map(|e| e["job"].as_str().unwrap()).collect();
+    started_jobs.sort_unstable();
+    assert_eq!(started_jobs, vec!["a", "b", "c", "d"]);
+
+    let finished = events_of_type(&events, "job_finished");
+    assert_eq!(finished.len(), 4);
+    assert!(finished.iter().all(|e| e["outcome"] == "built"));
+    assert!(finished.iter().all(|e| e["total"] == 4));
+
+    let run_finished = events_of_type(&events, "run_finished");
+    assert_eq!(run_finished.len(), 1);
+    assert_eq!(run_finished[0]["built"], 4);
+    assert_eq!(run_finished[0]["hits"], 0);
+    assert_eq!(run_finished[0]["failed"], 0);
+    assert_eq!(
+        events.last().unwrap()["type"], "run_finished",
+        "run_finished must be the last line"
+    );
+}
+
+/// Failures land in the log immediately and structurally: the failing job
+/// gets `job_failed` with the full `FailedJob` detail (exit code, reason
+/// with stderr tail), and its dependents get cascade `job_failed` events
+/// (`upstream failed: ...`) without ever seeing `job_started`. This is the
+/// "dig into failures right away" contract the webwatch frontend tails.
+#[test]
+fn event_log_records_failure_and_cascade() {
+    let (_dir, storeset) = fresh_storeset();
+    let exec = MockExecutor::new();
+    configure_diamond_outputs(&exec);
+    exec.set_exit_code("b", 3);
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("events.jsonl");
+
+    let report = scheduler::run_with_event_log(
+        &storeset,
+        &exec,
+        diamond_jobs(),
+        &callbacks,
+        &parallelism(1, &[]),
+        &abort,
+        Some(&log_path),
+    )
+    .unwrap();
+    assert_eq!(report.failed.len(), 2, "b fails, d cascades: {:?}", report.failed);
+
+    let events = read_events(&log_path);
+    let failed = events_of_type(&events, "job_failed");
+    assert_eq!(failed.len(), 2);
+
+    let b = failed.iter().find(|e| e["job"] == "b").expect("job_failed for b");
+    assert_eq!(b["detail"]["exit_code"], 3);
+    assert!(b["reason"].as_str().unwrap().contains("exited with code 3"));
+    assert!(b["detail"]["failure_log"].as_str().is_some());
+
+    let d = failed.iter().find(|e| e["job"] == "d").expect("cascade job_failed for d");
+    assert!(d["reason"].as_str().unwrap().contains("upstream failed: b"));
+    // The cascade detail is the synthesized bare FailedJob (no process).
+    assert!(d["detail"]["exit_code"].is_null());
+
+    let started: Vec<&str> = events_of_type(&events, "job_started")
+        .iter()
+        .map(|e| e["job"].as_str().unwrap())
+        .collect();
+    assert!(!started.contains(&"d"), "cascaded d must never start: {started:?}");
+}
+
+/// A `GraphJob` expansion grows `total` mid-run and the expansion itself
+/// finishes with `outcome="graph_expanded"` carrying the new total.
+#[test]
+fn event_log_graph_expansion_updates_total() {
+    let (_dir, storeset) = fresh_storeset();
+    let exec = MockExecutor::new();
+    exec.set_output("child", &[("out.txt", b"C")]);
+    let callbacks = TestCallbacks::new();
+    let mut expander = base_job("expander");
+    expander.exec_template = ExecTemplate::InProcess;
+    expander.graph_job = true;
+    callbacks.set_expansion("expander", vec![base_job("child")]);
+    let abort = AtomicBool::new(false);
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("events.jsonl");
+
+    let report = scheduler::run_with_event_log(
+        &storeset,
+        &exec,
+        vec![expander],
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+        Some(&log_path),
+    )
+    .unwrap();
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+
+    let events = read_events(&log_path);
+    assert_eq!(events_of_type(&events, "run_started")[0]["total"], 1);
+    let finished = events_of_type(&events, "job_finished");
+    let exp = finished.iter().find(|e| e["job"] == "expander").unwrap();
+    assert_eq!(exp["outcome"], "graph_expanded");
+    assert_eq!(exp["total"], 2, "total must reflect the expansion");
+}
+
+/// An unwritable event-log path must not fail (or change) the run — the
+/// log is strictly best-effort; the `RunReport` stays authoritative.
+#[test]
+fn event_log_unwritable_path_does_not_fail_the_run() {
+    let (_dir, storeset) = fresh_storeset();
+    let exec = MockExecutor::new();
+    configure_diamond_outputs(&exec);
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+
+    let report = scheduler::run_with_event_log(
+        &storeset,
+        &exec,
+        diamond_jobs(),
+        &callbacks,
+        &parallelism(4, &[]),
+        &abort,
+        Some(std::path::Path::new("/proc/definitely/not/writable/events.jsonl")),
+    )
+    .unwrap();
+    assert_eq!(report.built.len(), 4);
+    assert!(report.failed.is_empty());
+}
+
+// ================================================= view-path parent dirs
+
+/// An executor that writes files with a bare `fs::write` — no
+/// `create_dir_all` — so it only succeeds if the scheduler pre-created the
+/// nested output path's parent directory in staging (the "Directory
+/// nonexistent" pitfall for `view = {"out": "results/x.tsv"}` jobs).
+struct StrictWriteExecutor;
+
+impl Executor for StrictWriteExecutor {
+    fn run(
+        &self,
+        job: &PreparedJob,
+    ) -> std::result::Result<ExecResult, error_stack::Report<Error>> {
+        std::fs::write(job.out_dir.join("results/nested/x.tsv"), b"data")
+            .map_err(|e| error_stack::Report::new(Error::Other(format!("write failed: {e}"))))?;
+        Ok(ExecResult { exit_code: 0, stdout: Vec::new(), stderr: Vec::new() })
+    }
+}
+
+#[test]
+fn nested_view_path_parent_dirs_are_precreated_in_staging() {
+    let (_dir, storeset) = fresh_storeset();
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+
+    let mut job = base_job("nested");
+    job.outputs_declared = vec!["results/nested/x.tsv".to_string()];
+    job.view.insert("out".to_string(), "results/nested/x.tsv".to_string());
+
+    let report = scheduler::run(
+        &storeset,
+        &StrictWriteExecutor,
+        vec![job],
+        &callbacks,
+        &parallelism(1, &[]),
+        &abort,
+    )
+    .unwrap();
+    assert!(
+        report.failed.is_empty(),
+        "nested view path must not need a job-side mkdir: {:?}",
+        report.failed
+    );
+    assert_eq!(report.built, vec!["nested".to_string()]);
+}
+
+/// `..` components in a declared path must never cause directory creation
+/// outside the staging dir (the job then fails on its own, which is fine —
+/// the guard is about not escaping, not about rescuing the job).
+#[test]
+fn parent_dir_precreation_never_escapes_staging() {
+    let (dir, storeset) = fresh_storeset();
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+
+    let mut job = base_job("escape");
+    job.outputs_declared = vec!["../../escaped/x.txt".to_string()];
+    job.view.insert("out".to_string(), "../../escaped/x.txt".to_string());
+
+    let _ = scheduler::run(
+        &storeset,
+        &StrictWriteExecutor,
+        vec![job],
+        &callbacks,
+        &parallelism(1, &[]),
+        &abort,
+    )
+    .unwrap();
+    assert!(
+        !dir.path().join("v1/escaped").exists() && !dir.path().join("escaped").exists(),
+        "no directory may be created outside staging"
+    );
+}

@@ -306,9 +306,14 @@ fn binary_on_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// Additive 8th argument (webwatch phase 2, see STATUS.md): `event_log`,
+// an optional path for the scheduler's best-effort JSONL run-event log
+// (`scheduler::EventLog` — per-job started/finished/failed progress an
+// outside tailer can watch live). `None` (the default) writes nothing and
+// preserves the pre-existing behavior byte-for-byte.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (handle, jobs_json, parallelism_json, callbacks, work_dir, template_argv = Vec::new(), session = None, sandbox = String::new()))]
+#[pyo3(signature = (handle, jobs_json, parallelism_json, callbacks, work_dir, template_argv = Vec::new(), session = None, sandbox = String::new(), event_log = None))]
 fn run(
     py: Python<'_>,
     handle: &StoreSetHandle,
@@ -319,6 +324,7 @@ fn run(
     template_argv: Vec<String>,
     session: Option<PyRef<'_, Session>>,
     sandbox: String,
+    event_log: Option<String>,
 ) -> PyResult<String> {
     let jobs: Vec<JobDef> = serde_json::from_str(jobs_json).map_err(to_pyerr)?;
     let parallelism: BTreeMap<String, u64> =
@@ -385,13 +391,14 @@ fn run(
 
     let report = py
         .allow_threads(|| {
-            scheduler::run(
+            scheduler::run_with_event_log(
                 &handle.inner,
                 &executor,
                 jobs,
                 &host_callbacks,
                 &parallelism,
                 &abort,
+                event_log.as_deref().map(std::path::Path::new),
             )
         })
         .map_err(to_pyerr)?;

@@ -734,6 +734,71 @@ Totals after this WP: Rust untouched; +18 Python tests in
 `test_webwatch.py`, all green (pre-existing environment-dependent
 failures in the container unaffected).
 
+## Webwatch phase 2 — live per-job progress + runner event log — done
+
+"Seeing what's going on live, digging into failures right away" — per-job
+state now streams to the webwatch page *while a run executes*, instead of
+appearing only after `ppg3.run()` returns.
+
+**Rust (`scheduler.rs`):** new `run_with_event_log(...)` (plain `run`
+delegates with `None`, same additive pattern as
+`write_generation_with_vcs`): when given a path, the scheduler appends a
+JSONL event per state transition — `run_started` (run_id, total),
+`job_started`, `job_finished` (outcome built/hit/inprocess/
+graph_expanded + current total, which grows on GraphJob expansion),
+`job_failed` (reason + the full structured `FailedJob` detail, including
+upstream-cascade failures), `run_finished` (final counts). Strictly
+best-effort: an unopenable path or failed write never fails or slows the
+run (tested); the `RunReport` stays authoritative. The log lives inside
+`State` so `fail_job`'s cascades emit under the same lock as everything
+else — no second mutex. Plumbed through `_core.run` as an additive
+optional 8th argument (`event_log = None`).
+
+**Rust (same pass, the "Directory nonexistent" pitfall):**
+`dispatch_argv_job` now pre-creates the parent directory of every
+`job.view` / `outputs_declared` path inside the staging data dir, so a
+nested view path (`view={"out": "results/x.tsv"}`) no longer requires the
+job to `mkdir -p` its own output parents. Guarded against `..`/absolute
+components (never creates outside staging — tested). Works through all
+executors since `<work>/ppg/out` symlinks (None/forkserver) or
+bind-mounts (bwrap) the same staging dir.
+
+**Python:** `run.py` names a unique per-run log
+(`<project_dir>/run-events-<ns>.jsonl`), records it in the last-run-info
+slot *before* `_core.run` starts (so a live observer can attach mid-run),
+passes it down, and unlinks the previous run's file (at most one on
+disk). Unique-per-run is deliberate: the tailer never has to handle
+in-place truncation — a path change *is* the run boundary, with the
+in-band `run_started` as a redundant second signal.
+`webwatch.EventLogTailer` (daemon thread) polls the file — same polling
+deviation, same no-deps reason as `PollingWatcher` — and folds event
+batches into a new `live` section of the state snapshot (one lock
+acquisition + one SSE broadcast per poll batch, not per event). The page
+grew a "current run" panel: progress meter (done/failed/running/pending
+segments, counts always spelled out in text next to it — never
+color-alone), running jobs with ticking elapsed time, failed jobs shown
+with the full drill-down (exception, log path, staged-output path, full
+reason) the moment they fail, finished jobs collapsed.
+
+**Directory view outputs (question that came up alongside):** verified
+end-to-end that `view={"plots": "plots"}` + a job writing a tree under
+`/ppg/out/plots/` already works — publish hashes recursively
+(content-map keys like `plots/sub/b.txt`), and `write_generation`
+symlinks the directory itself into the view. It worked by accident
+(nothing enforces `path_within_entry` being a manifest *file* key);
+pinned deliberately with a new `views.rs` integration test. Making it
+first-class (e.g. a trailing-slash convention so the scheduler could
+pre-create the dir itself and `explain`/subset semantics could be
+defined) is future work.
+
+Totals after this WP: +6 Rust tests in `tests/scheduler.rs`, +1 in
+`tests/views.rs` (213 Rust tests total, clippy clean); +7 Python tests in
+`test_webwatch.py` (25 there in total), all green. Verified outside
+pytest too: a 6-job staggered demo pipeline under `python -m ppg3
+webwatch`, browser screenshots mid-run (progress meter + ticking elapsed)
+and mid-failure (drill-down visible while siblings still ran), clean
+SIGINT with tailer + server attached.
+
 ## TOFU source patcher (§7.6, WP11-adjacent) — done
 
 Python-only (rule: touch only `python/ppg3/{jobs,run}.py`, new

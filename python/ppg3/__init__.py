@@ -28,6 +28,7 @@ from .generations import verify_generation
 from .jj import JJError
 from .localscope import DefinitionError
 from .run import run, session_stop
+from .runscript import RunScriptChangedError
 from .tools import PyEnv, ToolSpec
 from .transport import Source
 
@@ -53,6 +54,7 @@ __all__ = [
     "Out",
     "Tool",
     "DefinitionError",
+    "RunScriptChangedError",
     "JJError",
 ]
 

@@ -121,6 +121,81 @@ assert os.path.isfile(".ppg3/views/1/.ephemeral")   # marked transient
 assert open("outputs/probe.txt").read() == "probe\n"
 ```
 
+## One project dir, one run script {#run-script}
+
+A project dir has **one** generation sequence, one `views/current`, one
+`outputs/` symlink. Two different scripts sharing it would take turns
+replacing each other's `outputs/` — almost always an accident. `run()`
+therefore records the running script's path in
+`<project_dir>/run_script` (its own file, nothing else in it) on the
+first run, and *refuses to run* when a different script shows up:
+
+<!-- ppg3-example: run-script-guard requires=core -->
+```python
+import os
+import subprocess
+import sys
+
+PIPELINE = """
+import ppg3
+from ppg3.tools import PyEnv
+ppg3.new(stores=[ppg3.Store("main", "store")], default_python=PyEnv.current())
+ppg3.CommandJob(outputs={"o": "%s"}, argv=["/bin/sh", "-c", "echo hi > {out:o}"])
+ppg3.run()
+"""
+
+open("a.py", "w").write(PIPELINE % "a.txt")
+open("b.py", "w").write(PIPELINE % "b.txt")
+
+assert subprocess.run([sys.executable, "a.py"]).returncode == 0
+assert open(".ppg3/run_script").read().strip() == os.path.realpath("a.py")
+
+# A different script against the same project dir is refused, before any
+# side effect — no generation is written, outputs/ still belongs to a.py:
+proc = subprocess.run([sys.executable, "b.py"], capture_output=True, text=True)
+assert proc.returncode != 0
+assert "run_script" in proc.stderr
+assert not os.path.exists("outputs/b.txt")
+
+# The record is the whole decision: delete it to hand the dir over.
+os.remove(".ppg3/run_script")
+assert subprocess.run([sys.executable, "b.py"]).returncode == 0
+assert open("outputs/b.txt").read() == "hi\n"
+```
+
+Renames are recognized, not punished: when the recorded script no longer
+exists *and* no other `*.py` file next to the project dir looks like a
+ppg3 run script, the record updates silently — you renamed your one
+pipeline script, nothing is contested:
+
+<!-- ppg3-example: run-script-rename requires=core -->
+```python
+import os
+import subprocess
+import sys
+
+os.makedirs("proj")
+open("proj/pipeline.py", "w").write("""
+import ppg3
+from ppg3.tools import PyEnv
+ppg3.new(stores=[ppg3.Store("main", "store")], default_python=PyEnv.current())
+ppg3.CommandJob(outputs={"o": "x.txt"}, argv=["/bin/sh", "-c", "echo x > {out:o}"])
+ppg3.run()
+""")
+assert subprocess.run([sys.executable, "pipeline.py"], cwd="proj").returncode == 0
+
+os.rename("proj/pipeline.py", "proj/renamed.py")
+assert subprocess.run([sys.executable, "renamed.py"], cwd="proj").returncode == 0
+record = open("proj/.ppg3/run_script").read().strip()
+assert record == os.path.realpath("proj/renamed.py")
+```
+
+If both scripts are meant to exist, give each its own project dir
+(`ppg3.new(project_dir=...)`) — separate generation sequences, separate
+`outputs/`, separate retention. Interactive use (a REPL, a notebook,
+`python -c`) has no script identity; the guard skips it and leaves any
+record untouched.
+
 ## The return value: `RunResult`
 
 `run()` returns a `RunResult`. Its collections are keyed by job **label** —

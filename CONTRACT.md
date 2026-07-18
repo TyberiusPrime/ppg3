@@ -726,3 +726,21 @@ per-call `template_argv` when given), `_core.session_shutdown(session)`,
 `_core.session_template_count(session)`. Python keeps one module-level
 Session per process (run.py); `ppg3.session_stop()` ends it and clears the
 ik-keyed loader memos.
+
+## Additive addendum: run-script ownership guard (`.ppg3/run_script`)
+
+A project dir has one generation sequence / `current` / `outputs`, so two
+different run scripts sharing it silently replace each other's `outputs/`.
+`ppg3.run()` (Python side only — the Rust CLI never reads or writes this)
+therefore records the running script's real path (`sys.argv[0]`; watch
+mode's definition pass patches `sys.argv`, so the watched script is
+recorded, not `ppg3/__main__.py`) in `<project_dir>/run_script` — its own
+single-line file — and refuses to run under a *different* script, telling
+the user to delete the file to hand the project dir over. Rename/move
+exception: recorded script gone from disk AND no other `*.py` beside the
+project dir looks like a ppg3 run script (heuristic: mentions `ppg3` and
+contains a `run(` call) ⇒ the record is updated silently. No script
+identity (REPL, `python -c`) ⇒ the check is skipped entirely. New:
+`python/ppg3/runscript.py` (`check_and_record`, `RunScriptChangedError`,
+exported from the package), `python/tests/test_runscript.py`; `run()`
+calls the check before any other side effect.

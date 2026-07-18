@@ -737,6 +737,13 @@ def run(
     if graph is None:
         raise RuntimeError("ppg3.run(): no graph — call ppg3.new(...) first")
 
+    # Single-script ownership of the project dir (see runscript.py): refuse
+    # to run when a *different* script last used this project_dir — before
+    # any other side effect, so a refused run leaves no trace.
+    from .runscript import check_and_record
+
+    check_and_record(graph.project_dir)
+
     core = get_core()
 
     # jj support (ppg3.new(jj=True), see jj.py): enforce that every

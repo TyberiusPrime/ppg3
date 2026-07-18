@@ -1156,3 +1156,21 @@ path since the file is re-read inside the job's own working directory.
 Totals: 270 Python tests green (2 skipped w/o real jj/golden), 37 of them
 docs examples; Rust suites green incl. the new views test; clippy clean;
 rustfmt clean on touched files.
+
+## Run-script ownership guard (`.ppg3/run_script`)
+
+One project dir = one generation sequence / `current` / `outputs`, so a
+second script sharing it silently replaces the first's `outputs/` on every
+run. `ppg3.run()` now records the running script's real path (from
+`sys.argv[0]`; watch mode's argv patch makes this the watched script) in
+`<project_dir>/run_script` — its own single-line file — and refuses to run
+under a different script, naming both scripts and the exact file to delete
+to hand the dir over. Rename/move case handled silently: recorded script
+gone from disk and no other `*.py` beside the project dir looking like a
+ppg3 run script (mentions `ppg3` + calls `ppg3.run(`/bare `run(`; method
+calls like `subprocess.run(` don't count) ⇒ the record just updates.
+No script identity (REPL, `python -c`, embedded) ⇒ check skipped. The
+check runs before any other `run()` side effect, so a refused run leaves
+no trace. New: `python/ppg3/runscript.py`, `python/tests/test_runscript.py`
+(unit + subprocess e2e), two executed docs examples in `api/run.md`,
+CONTRACT.md addendum. Rust side untouched (the CLI ignores the file).

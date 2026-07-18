@@ -697,9 +697,9 @@ fn subset_early_cutoff() {
 fn failure_propagation() {
     let (_dir, storeset) = fresh_storeset();
     let exec = MockExecutor::new();
-    exec.set_output("a", &[("a.txt", b"A")]);
+    exec.set_output("a", &[("out.txt", b"A")]);
     exec.set_exit_code("b", 1);
-    exec.set_output("d", &[("d.txt", b"D")]);
+    exec.set_output("d", &[("out.txt", b"D")]);
 
     let a = base_job("a");
     let b = base_job("b");
@@ -826,6 +826,115 @@ fn failure_log_written_on_executor_error() {
     assert!(report.failed["b"].contains("ppg3-core error"));
 }
 
+/// Output contract, fresh build: a job that exits 0 without writing a
+/// declared output is an ordinary aggregated job failure (with the entry
+/// path + what it did write in the message, `missing_outputs` structured
+/// detail, a failure.log, and the usual cascade to dependents) — never a
+/// later views-layer crash. Its entry stays published (P8), so a rerun is
+/// a lookup hit that fails the same way *without re-running the job*.
+#[test]
+fn missing_declared_output_is_job_failure_with_entry_path() {
+    let (_dir, storeset) = fresh_storeset();
+    let exec = MockExecutor::new();
+    // "a" declares out.txt (base_job default) but writes something else.
+    exec.set_output("a", &[("wrong-name.txt", b"A")]);
+
+    let a = base_job("a");
+    let b = dep_job("b", &[("a", "a")]);
+
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        vec![a.clone(), b.clone()],
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
+
+    // A regular per-job failure, cascaded to the dependent.
+    assert!(report.built.is_empty());
+    assert!(report.failed.contains_key("a"), "{:?}", report.failed);
+    assert!(report.failed.contains_key("b"));
+    assert_eq!(exec.count("b"), 0, "dependent must not dispatch");
+
+    let reason = &report.failed["a"];
+    assert!(
+        reason.contains("without writing declared output(s)"),
+        "{reason}"
+    );
+    assert!(reason.contains("\"out.txt\""), "{reason}");
+    assert!(reason.contains("\"wrong-name.txt\""), "{reason}");
+
+    let detail = report.failed_details.get("a").expect("detail for a");
+    assert_eq!(detail.missing_outputs, vec!["out.txt".to_string()]);
+    assert_eq!(detail.exit_code, Some(0));
+
+    // The message names the *published entry* path, and the file the job
+    // actually wrote is really there (finished work is never withheld).
+    let entry_dir = detail.out_dir.as_deref().expect("entry path in detail");
+    assert!(reason.contains(entry_dir), "{reason} vs {entry_dir}");
+    assert!(
+        std::path::Path::new(entry_dir)
+            .join("wrong-name.txt")
+            .is_file(),
+        "produced file must be inspectable at {entry_dir}"
+    );
+
+    // Consolidated log with the explanation + fix guidance.
+    let log = detail.failure_log.as_deref().expect("failure.log written");
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(text.contains("missing declared outputs"), "{text}");
+    assert!(text.contains("outputs="), "{text}");
+
+    // Rerun: the published entry is a lookup hit — the job is NOT re-run,
+    // and the failure (now "cached entry") still names the entry path.
+    let exec2 = MockExecutor::new();
+    let report2 = scheduler::run(
+        &storeset,
+        &exec2,
+        vec![a, b],
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
+    assert_eq!(exec2.total_invocations(), 0, "hit must not re-run the job");
+    let reason2 = &report2.failed["a"];
+    assert!(reason2.contains("cached entry"), "{reason2}");
+    assert!(reason2.contains("\"out.txt\""), "{reason2}");
+    assert!(reason2.contains(entry_dir), "{reason2}");
+    let detail2 = report2.failed_details.get("a").unwrap();
+    assert_eq!(detail2.missing_outputs, vec!["out.txt".to_string()]);
+}
+
+/// Output contract: a declared output name may be a *directory* the job
+/// fills — any file below `<name>/` satisfies it.
+#[test]
+fn declared_output_satisfied_by_directory() {
+    let (_dir, storeset) = fresh_storeset();
+    let exec = MockExecutor::new();
+    let mut a = base_job("a");
+    a.outputs_declared = vec!["reports".to_string()];
+    exec.set_output("a", &[("reports/index.html", b"<html>")]);
+
+    let callbacks = TestCallbacks::new();
+    let abort = AtomicBool::new(false);
+    let report = scheduler::run(
+        &storeset,
+        &exec,
+        vec![a],
+        &callbacks,
+        &parallelism(2, &[]),
+        &abort,
+    )
+    .unwrap();
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(report.built, vec!["a".to_string()]);
+}
+
 /// Every pre-dispatch validation failure (cycle, unknown dep, duplicate id,
 /// over-capacity resource request) must surface as `Error::Graph` from
 /// `run()` itself, before the executor is ever touched.
@@ -927,7 +1036,7 @@ fn graph_error_before_dispatch() {
 fn abort_stops_dispatch() {
     let (_dir, storeset) = fresh_storeset();
     let exec = MockExecutor::new();
-    exec.set_output("a", &[("a.txt", b"A")]);
+    exec.set_output("a", &[("out.txt", b"A")]);
     let abort = Arc::new(AtomicBool::new(false));
     exec.set_abort_on("a", abort.clone());
 

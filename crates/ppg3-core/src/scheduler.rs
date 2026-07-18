@@ -34,6 +34,7 @@
 //! subgraphs continue" true even when a job hits a store-level hard error.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
@@ -162,6 +163,12 @@ pub struct FailedJob {
     /// Wall-clock time the executor spent on the job, in milliseconds. Only
     /// set for a job that reached the executor.
     pub runtime_ms: Option<i64>,
+    /// Declared output names the job's store entry does not contain — set
+    /// when that is the failure (the job ran fine but never wrote
+    /// `/ppg/out/<name>`, freshly or in the cached entry a hit found).
+    /// Empty for every other failure kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_outputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -653,6 +660,23 @@ fn dispatch_argv_job(
     completed: &HashMap<String, CompletedInfo>,
 ) -> Result<JobOutcome> {
     if let Some((store_idx, manifest)) = shared.storeset.lookup(ik)? {
+        // The output contract holds for cached entries too: an entry
+        // published without every declared output (typically by this same
+        // job on an earlier run) must keep failing the job — with the entry
+        // path in hand — not resurface later as a views-layer crash.
+        let missing = missing_declared_outputs(job, &manifest.content);
+        if !missing.is_empty() {
+            let data_dir = shared.storeset.stores[store_idx].data_dir(&manifest.output_hash);
+            return Ok(missing_outputs_failure(
+                &missing,
+                &manifest.content,
+                &data_dir,
+                true,
+                None,
+                None,
+                None,
+            ));
+        }
         return Ok(JobOutcome::Hit {
             ik: ik.to_string(),
             oh: manifest.output_hash,
@@ -745,8 +769,14 @@ fn dispatch_argv_job(
             // with locations + backtrace); color is disabled globally at the
             // top of `run()` so this stays clean in a file.
             let rendered = format!("{report:?}");
-            let failure_log =
-                executor::write_failure_log(&log_dir, &job.id, None, Some(&rendered), b"", b"");
+            let failure_log = executor::write_failure_log(
+                &log_dir,
+                &job.id,
+                None,
+                Some(("rust error (ppg3-core)", &rendered)),
+                b"",
+                b"",
+            );
             let reason = format!(
                 "job {:?} failed to execute (ppg3-core error):\n{}",
                 job.id, rendered
@@ -758,6 +788,7 @@ fn dispatch_argv_job(
                 exit_code: None,
                 out_dir: Some(out_dir_str.clone()),
                 runtime_ms: Some(now_ms() - start_ms),
+                missing_outputs: Vec::new(),
             };
             return Ok(JobOutcome::Failed {
                 reason,
@@ -792,6 +823,7 @@ fn dispatch_argv_job(
             exit_code: Some(exec_result.exit_code),
             out_dir: Some(out_dir_str.clone()),
             runtime_ms: Some(end_ms - start_ms),
+            missing_outputs: Vec::new(),
         };
         return Ok(JobOutcome::Failed {
             reason,
@@ -815,6 +847,34 @@ fn dispatch_argv_job(
             "just-published entry for input key {ik} vanished from its own store"
         ))
     })?;
+
+    // Output contract: the job ran to completion, but a declared output it
+    // never wrote is still a *job* failure — reported now, in the normal
+    // aggregated failure table, never later as a views-layer crash. The
+    // entry stays published (P8: finished work is never withheld; the next
+    // run hits it and fails with the same message instead of re-running).
+    let missing = missing_declared_outputs(job, &manifest.content);
+    if !missing.is_empty() {
+        let data_dir = write_store.data_dir(outcome.oh());
+        let explanation = missing_outputs_explanation(&missing, &manifest.content, &data_dir);
+        let failure_log = executor::write_failure_log(
+            &log_dir,
+            &job.id,
+            Some(0),
+            Some(("missing declared outputs", &explanation)),
+            &exec_result.stdout,
+            &exec_result.stderr,
+        );
+        return Ok(missing_outputs_failure(
+            &missing,
+            &manifest.content,
+            &data_dir,
+            false,
+            Some(&log_dir),
+            failure_log.as_deref(),
+            Some(end_ms - start_ms),
+        ));
+    }
 
     if let Some(declared) = &job.fixed_output {
         // `fixed_output` (a FetchJob's `blake3=`) pins the **content blake3 of
@@ -1167,6 +1227,108 @@ fn build_env(job: &JobDef) -> BTreeMap<String, String> {
         env.insert(k.clone(), v.clone());
     }
     env
+}
+
+// ================================================= output-contract checking
+
+/// Declared output names with no file in `content`: neither a file named
+/// exactly `<name>` nor anything below a `<name>/` directory (an output
+/// name may be a directory the job filled).
+fn missing_declared_outputs(job: &JobDef, content: &ContentMap) -> Vec<String> {
+    job.outputs_declared
+        .iter()
+        .filter(|name| {
+            let prefix = format!("{name}/");
+            !content.contains_key(name.as_str()) && !content.keys().any(|k| k.starts_with(&prefix))
+        })
+        .cloned()
+        .collect()
+}
+
+fn quoted_list(names: &[String], cap: usize) -> String {
+    if names.is_empty() {
+        return "(nothing)".to_string();
+    }
+    let mut s = names
+        .iter()
+        .take(cap)
+        .map(|n| format!("{n:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > cap {
+        s.push_str(&format!(" (+{} more)", names.len() - cap));
+    }
+    s
+}
+
+/// Full multi-line explanation for the consolidated failure log (P9: names
+/// the entry path and the produced files, ends with the next step).
+fn missing_outputs_explanation(
+    missing: &[String],
+    content: &ContentMap,
+    data_dir: &Path,
+) -> String {
+    let produced: Vec<String> = content.keys().cloned().collect();
+    format!(
+        "missing: {}\nwrote:   {}\nentry:   {}\n\
+         every output declared in outputs= must be written to /ppg/out/<name>.\n\
+         fix: make the job write the missing output(s), or change outputs= to the\n\
+         names the job actually writes (either change re-keys the job, so it re-runs).",
+        quoted_list(missing, 20),
+        quoted_list(&produced, 20),
+        data_dir.display(),
+    )
+}
+
+/// The `JobOutcome::Failed` for a job whose (fresh or cached) store entry
+/// lacks declared outputs. `cached` distinguishes "ran just now, exit 0,
+/// didn't write it" from "the cached entry from an earlier run doesn't have
+/// it". Either way this is an ordinary per-job failure: aggregated in the
+/// report, cascaded to dependents, never a whole-run abort.
+#[allow(clippy::too_many_arguments)]
+fn missing_outputs_failure(
+    missing: &[String],
+    content: &ContentMap,
+    data_dir: &Path,
+    cached: bool,
+    log_dir: Option<&Path>,
+    failure_log: Option<&Path>,
+    runtime_ms: Option<i64>,
+) -> JobOutcome {
+    let produced: Vec<String> = content.keys().cloned().collect();
+    let reason = if cached {
+        format!(
+            "cached entry is missing declared output(s) {} — the job never wrote \
+             /ppg/out/<name> when it last ran; the entry at {} contains: {}. Fix the \
+             job to write the missing output(s), or change outputs= to the name(s) it \
+             actually writes.",
+            quoted_list(missing, 5),
+            data_dir.display(),
+            quoted_list(&produced, 5),
+        )
+    } else {
+        format!(
+            "job finished (exit 0) without writing declared output(s) {}; it wrote: {} \
+             — kept at {}. Fix the job to write /ppg/out/<name>, or change outputs= to \
+             the name(s) it actually writes.",
+            quoted_list(missing, 5),
+            quoted_list(&produced, 5),
+            data_dir.display(),
+        )
+    };
+    let detail = FailedJob {
+        reason: reason.clone(),
+        log_dir: log_dir.map(|p| p.display().to_string()),
+        failure_log: failure_log.map(|p| p.display().to_string()),
+        exit_code: if cached { None } else { Some(0) },
+        out_dir: Some(data_dir.display().to_string()),
+        runtime_ms,
+        missing_outputs: missing.to_vec(),
+    };
+    JobOutcome::Failed {
+        reason,
+        detail: Some(detail),
+    }
 }
 
 fn stderr_tail(bytes: &[u8]) -> String {

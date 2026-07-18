@@ -398,7 +398,10 @@ pub(crate) fn write_failure_log(
     log_dir: &Path,
     job_id: &str,
     exit_code: Option<i32>,
-    rust_error: Option<&str>,
+    // Optional extra `(section header, body)` — the rendered Rust error
+    // chain for executor-level failures, or e.g. the missing-declared-
+    // outputs explanation for output-contract failures.
+    error_section: Option<(&str, &str)>,
     stdout: &[u8],
     stderr: &[u8],
 ) -> Option<PathBuf> {
@@ -417,9 +420,9 @@ pub(crate) fn write_failure_log(
             let _ = writeln!(buf, "exit code: (no process ran — executor error)");
         }
     }
-    if let Some(err) = rust_error {
-        let _ = writeln!(buf, "\n=== rust error (ppg3-core) ===");
-        let _ = writeln!(buf, "{}", err.trim_end());
+    if let Some((header, body)) = error_section {
+        let _ = writeln!(buf, "\n=== {header} ===");
+        let _ = writeln!(buf, "{}", body.trim_end());
     }
     let _ = writeln!(buf, "\n=== traceback / stderr ===");
     buf.extend_from_slice(stderr);

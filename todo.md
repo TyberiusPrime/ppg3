@@ -13,6 +13,20 @@ Resolved (branch claude/store-ppg3-gc-redesign-7vozjw):
   generation ever ran here" (drops all other generations + pins).
 - `ppg3 store nuke --store PATH --yes` (§11.3) — the rm-rf-the-store door.
 
+Resolved (branch claude/ppg3-job-output-validation-lpxdse):
+
+- missing declared outputs = regular aggregated job error with entry paths
+  (see the annotated item below).
+- `below=` on FileJob/CommandJob/DataJob/FetchJob/UnsandboxedJob: put all of
+  a job's outputs below one folder (`outputs={"c": "counts.tsv"},
+  below="samples/s1"` publishes samples/s1/counts.tsv). Pure publish-layer
+  sugar — identical to writing the joined paths by hand.
+- "why did this job not run / why is file xyz missing": failure reports now
+  aggregate upstream casualties by root cause; every run writes
+  `.ppg3/last_run.json`; `ppg3 why [path]` answers from it (status,
+  definition site, root-cause chain, log + entry paths, whether the file is
+  in the current output tree).
+
 Open:
 
 - pytest hangs? somewhere in test_watch.py
@@ -62,6 +76,10 @@ Open:
 - binary not in nd...
 
 - can we capture the python definition sites for the error output?
+  [RESOLVED — every job records its definition site (`Defined:` in failure
+   blocks); `.ppg3/last_run.json` persists label/defsite/status per job and
+   `ppg3 why <output path>` goes from a file back to the pipeline.py:line
+   that declared it.]
 
 - gc is not removing staging. generally, gc needs rework,
   we need gc 'aggressive', gc 'minimal', 'gc default', gc 'failed only'
@@ -86,6 +104,9 @@ Open:
    entries.]
 - how do I do a verify run?
 - how do I get from a store path to the python that generated it?
+  [PARTIAL — from an *output-tree* path: `ppg3 why <path>` (definition site,
+   status, root cause, entry/log paths). From a raw entries/<oh> path: still
+   open.]
 
 - how do I set a commandjobs stdout in the view?
 
@@ -98,6 +119,12 @@ Open:
 
 - jobs that didn't produce their views completly derail the error output, 
   they don't get listed in the table, and they fail afterwards with a stupid error message
+  [RESOLVED — a job that finishes without writing a declared output is now an
+   ordinary aggregated job failure (scheduler-side check, fresh builds *and*
+   cached hits): it appears in the failure table with `Missing:` + the store
+   entry path + what it did write, gets a failure.log, and cascades normally.
+   Never reaches the views layer. Also: cascaded "did not run" jobs no longer
+   get one block each — one compact section grouped by root cause.]
 
 - the whole name thing is unsound and needs fable level rethinking.
 

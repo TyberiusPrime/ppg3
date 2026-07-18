@@ -433,6 +433,28 @@ def _normalize_outputs(outputs: Any, kind: str) -> Dict[str, str]:
     )
 
 
+def _apply_below(publish: Dict[str, str], below: Optional[str], kind: str) -> Dict[str, str]:
+    """``below=``: prefix every output destination with a folder — pure
+    convenience for "put all this job's outputs below folder X", so a batch
+    of destinations doesn't repeat the folder in every path. Publish-layer
+    only (P1.4): the entry layout and the job's identity key are untouched,
+    exactly as if the caller had written the joined paths by hand."""
+    if below is None:
+        return publish
+    if not isinstance(below, str) or not below:
+        raise DefinitionError(
+            f"{kind}(below=...): expected a non-empty str — a folder in the "
+            "output tree to put this job's outputs under"
+        )
+    norm = below.strip("/")
+    if not norm or any(part in ("", ".", "..") for part in norm.split("/")):
+        raise DefinitionError(
+            f"{kind}(below={below!r}): must be a relative folder path with "
+            "no '.'/'..' components"
+        )
+    return {name: f"{norm}/{dest}" for name, dest in publish.items()}
+
+
 # --------------------------------------------------------------------------
 # Input lowering
 # --------------------------------------------------------------------------
@@ -675,6 +697,7 @@ class FileJob(Job):
         retain: Any = None,
         python: Optional[PyEnv] = None,
         store: Optional[str] = None,
+        below: Optional[str] = None,
     ):
         """
         outputs = output name -> output-tree destination (optional: omit
@@ -685,10 +708,12 @@ class FileJob(Job):
         env     = environment variables (declared = keyed + visible, P5.4)
         python  = Python environment
         retain  = Retain.Default | Retain.Evict | Retain.Pin - GC behaviour
+        below   = optional folder to put every output destination under
+                  (``outputs={"a": "x.txt"}, below="s1"`` publishes s1/x.txt)
         """
         if run is None:
             raise DefinitionError("FileJob requires run= (a callable or ppg3.Source)")
-        publish = _normalize_outputs(outputs, "FileJob")
+        publish = _apply_below(_normalize_outputs(outputs, "FileJob"), below, "FileJob")
         graph = _require_current_graph()
         python_env = python or graph.default_python
         if python_env is None:
@@ -800,10 +825,11 @@ class CommandJob(Job):
         resources: Optional[Resources] = None,
         retain: Any = None,
         store: Optional[str] = None,
+        below: Optional[str] = None,
     ):
         if argv is None:
             raise DefinitionError("CommandJob requires argv=")
-        publish = _normalize_outputs(outputs, "CommandJob")
+        publish = _apply_below(_normalize_outputs(outputs, "CommandJob"), below, "CommandJob")
         graph = _require_current_graph()
         super().__init__(graph, publish)
         self.argv_template = serialize_argv(argv)
@@ -917,6 +943,7 @@ class FetchJob(Job):
         blake3: Optional[str] = None,
         retain: Any = None,
         store: Optional[str] = None,
+        below: Optional[str] = None,
     ):
         if url is None:
             raise DefinitionError("FetchJob requires url=")
@@ -929,6 +956,7 @@ class FetchJob(Job):
                 "FetchJob(outputs=...) must be a single output-tree path "
                 "(str), or None for an internal fetch"
             )
+        publish = _apply_below(publish, below, "FetchJob")
         graph = _require_current_graph()
         if blake3 is None and graph.frozen:
             raise DefinitionError(
@@ -1092,12 +1120,14 @@ class UnsandboxedJob(Job):
         env: Optional[Dict[str, str]] = None,
         resources: Optional[Resources] = None,
         retain: Any = None,
+        below: Optional[str] = None,
     ):
         graph = _require_current_graph()
         if isinstance(outputs, str):
             publish = {"out": outputs}
         else:
             publish = _normalize_outputs(outputs, "UnsandboxedJob")
+        publish = _apply_below(publish, below, "UnsandboxedJob")
         super().__init__(graph, publish)
         self.run = run
         src = _callable_source_file(run)

@@ -166,6 +166,18 @@ enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// Why is this file (not) in the output tree — did its job run, fail,
+    /// or get skipped because an upstream failed? Reads the per-job record
+    /// of the most recent run (`.ppg3/last_run.json`) and answers in user
+    /// terms: definition site, status, root cause, log/entry paths.
+    Why {
+        /// A path in the output tree (e.g. `results/counts.tsv`; an
+        /// `outputs/` prefix is stripped automatically). Omit to list
+        /// every job of the last run with its status.
+        path: Option<String>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
     /// Explain why a view path's content changed vs. the previous generation.
     Explain {
         /// View-relative path, e.g. `results/counts.tsv` (an `outputs/`
@@ -403,6 +415,10 @@ fn run(cli: Cli) -> Result<i32, AppError> {
         } => {
             let project_dir = config::resolve_project_dir(project.as_deref())?;
             cmd_rollback(&project_dir, generation, json)
+        }
+        Command::Why { path, project } => {
+            let project_dir = config::resolve_project_dir(project.as_deref())?;
+            cmd_why(&project_dir, path.as_deref(), json)
         }
         Command::Explain { view_path, project } => {
             let project_dir = config::resolve_project_dir(project.as_deref())?;
@@ -932,6 +948,241 @@ fn cmd_jj_add_ignores(project_dir: &Path, json: bool) -> Result<i32, AppError> {
         println!("{} already ignores all ppg3 paths", gitignore.display());
     } else {
         println!("added to {}: {}", gitignore.display(), missing.join(", "));
+    }
+    Ok(0)
+}
+
+// ---- why ----
+
+/// One job's record in `.ppg3/last_run.json` (written by the Python side's
+/// `run.py::_write_last_run` after every run, success or failure). All
+/// fields user-facing per P1.5: label = published destination(s), defsite =
+/// `file.py:line`. `#[serde(default)]` everywhere so schema growth on the
+/// writer side never breaks an older CLI.
+#[derive(Debug, Clone, Default, serde::Deserialize, Serialize)]
+struct LastRunJob {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    defsite: String,
+    /// output name -> output-tree destination.
+    #[serde(default)]
+    outputs: std::collections::BTreeMap<String, String>,
+    /// "built" | "hit" | "failed" | "not_run" (upstream failed) |
+    /// "not_reached" (run stopped first).
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    reason: Option<String>,
+    /// Root-cause job label, for status == "not_run".
+    #[serde(default)]
+    upstream: Option<String>,
+    #[serde(default)]
+    failure_log: Option<String>,
+    #[serde(default)]
+    log_dir: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    missing_outputs: Vec<String>,
+    #[serde(default)]
+    out_dir: Option<String>,
+    /// The store entry's `data/` dir, when the run recorded one.
+    #[serde(default)]
+    entry: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, Serialize)]
+struct LastRun {
+    #[serde(default)]
+    schema: u64,
+    #[serde(default)]
+    created_at_ms: i64,
+    #[serde(default)]
+    project_id: String,
+    #[serde(default)]
+    generation: Option<u64>,
+    #[serde(default)]
+    partial_dir: Option<String>,
+    #[serde(default)]
+    jobs: Vec<LastRunJob>,
+}
+
+fn load_last_run(project_dir: &Path) -> Result<LastRun, AppError> {
+    let path = project_dir.join("last_run.json");
+    let bytes = std::fs::read(&path).map_err(|e| {
+        AppError::Operational(format!(
+            "no last-run record at {} ({e}); `ppg3 why` answers from the most \
+             recent run — run the pipeline once (ppg3.run()) first",
+            path.display()
+        ))
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::Operational(format!("parsing {}: {e}", path.display())))
+}
+
+/// `true` if this generation currently links `view_path` (best-effort:
+/// a missing/corrupt meta is treated as "not present").
+fn in_current_generation(project_dir: &Path, view_path: &str) -> Option<u64> {
+    let n = views::current_generation_number(project_dir).ok()??;
+    let meta = views::read_generation_meta(project_dir, n).ok()?;
+    meta.entries
+        .iter()
+        .any(|e| e.view_rel_path == view_path)
+        .then_some(n)
+}
+
+fn print_why_job(job: &LastRunJob, last: &LastRun, project_dir: &Path) {
+    let dests: Vec<&str> = job.outputs.values().map(String::as_str).collect();
+    println!("{}", job.label);
+    if !job.defsite.is_empty() {
+        println!("  defined at: {}", job.defsite);
+    }
+    match job.status.as_str() {
+        "built" => println!("  last run:   built (ran and published its outputs)"),
+        "hit" => println!("  last run:   cache hit (unchanged, reused the stored result)"),
+        "failed" => {
+            println!("  last run:   FAILED");
+            if let Some(reason) = &job.reason {
+                for line in reason.lines().take(6) {
+                    println!("    {line}");
+                }
+            }
+            if !job.missing_outputs.is_empty() {
+                println!("  missing outputs: {}", job.missing_outputs.join(", "));
+            }
+            if let Some(log) = job.failure_log.as_deref().or(job.log_dir.as_deref()) {
+                println!("  log:        {log}");
+            }
+            if let Some(dir) = job.entry.as_deref().or(job.out_dir.as_deref()) {
+                println!("  produced:   {dir}");
+            }
+        }
+        "not_run" => {
+            let root_label = job.upstream.clone().unwrap_or_default();
+            println!("  last run:   did not run — upstream job {root_label} failed");
+            if let Some(root) = last.jobs.iter().find(|j| j.label == root_label) {
+                println!("  root cause: {root_label}");
+                if !root.defsite.is_empty() {
+                    println!("    defined at: {}", root.defsite);
+                }
+                if let Some(reason) = &root.reason {
+                    for line in reason.lines().take(6) {
+                        println!("    {line}");
+                    }
+                }
+                if let Some(log) = root.failure_log.as_deref().or(root.log_dir.as_deref()) {
+                    println!("    log:        {log}");
+                }
+            }
+        }
+        "not_reached" => {
+            println!("  last run:   not reached (the run stopped before this job was dispatched)")
+        }
+        other => println!("  last run:   {other}"),
+    }
+    // Is the file actually in the browsable output tree right now?
+    for dest in &dests {
+        match in_current_generation(project_dir, dest) {
+            Some(n) => println!("  in output tree: yes — outputs/{dest} (generation {n})"),
+            None => {
+                println!("  in output tree: no — outputs/{dest} does not exist");
+                if let (Some(partial), true) = (&last.partial_dir, job.entry.is_some()) {
+                    println!("    (finished outputs of the failed run: {partial})");
+                }
+            }
+        }
+    }
+}
+
+fn cmd_why(project_dir: &Path, raw_path: Option<&str>, json: bool) -> Result<i32, AppError> {
+    let last = load_last_run(project_dir)?;
+
+    // No path: one status line per job of the last run.
+    let Some(raw_path) = raw_path else {
+        if json {
+            print_json(&last)?;
+            return Ok(0);
+        }
+        for job in &last.jobs {
+            let status = match job.status.as_str() {
+                "not_run" => format!(
+                    "did not run (upstream {} failed)",
+                    job.upstream.as_deref().unwrap_or("?")
+                ),
+                other => other.to_string(),
+            };
+            println!("{:<12} {}  [{}]", status, job.label, job.defsite);
+        }
+        return Ok(0);
+    };
+    let wanted = normalize_view_path(raw_path);
+
+    // Exact destination match first; then suffix ("counts.tsv" finds
+    // "results/counts.tsv"); then label match (a job's label is its joined
+    // destinations, or `<kind @ file:line>` for internal jobs).
+    let exact: Vec<&LastRunJob> = last
+        .jobs
+        .iter()
+        .filter(|j| j.outputs.values().any(|d| *d == wanted))
+        .collect();
+    let matches: Vec<&LastRunJob> = if !exact.is_empty() {
+        exact
+    } else {
+        last.jobs
+            .iter()
+            .filter(|j| {
+                j.label == raw_path
+                    || j.outputs
+                        .values()
+                        .any(|d| d.ends_with(&format!("/{wanted}")))
+            })
+            .collect()
+    };
+
+    if matches.is_empty() {
+        if json {
+            print_json(&serde_json::json!({"matches": [], "query": wanted}))?;
+            return Ok(1);
+        }
+        println!("no job in the last run publishes {wanted:?}");
+        let mut close: Vec<&str> = last
+            .jobs
+            .iter()
+            .flat_map(|j| j.outputs.values())
+            .filter(|d| {
+                let base = wanted.rsplit('/').next().unwrap_or(&wanted);
+                !base.is_empty() && d.contains(base)
+            })
+            .map(String::as_str)
+            .collect();
+        close.sort_unstable();
+        close.dedup();
+        if !close.is_empty() {
+            println!("close matches:");
+            for c in close.iter().take(5) {
+                println!("  {c}");
+            }
+        } else {
+            println!(
+                "(the last run knew {} job(s); `ppg3 why` with no path lists them)",
+                last.jobs.len()
+            );
+        }
+        return Ok(1);
+    }
+
+    if json {
+        print_json(&serde_json::json!({"matches": matches, "query": wanted}))?;
+        return Ok(0);
+    }
+    for (i, job) in matches.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        print_why_job(job, &last, project_dir);
     }
     Ok(0)
 }

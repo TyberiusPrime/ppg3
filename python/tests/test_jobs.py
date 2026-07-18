@@ -253,3 +253,68 @@ def test_no_active_graph_raises():
     jobs_mod._current_graph = None
     with pytest.raises(DefinitionError):
         ppg3.CommandJob(outputs={"a": "a.txt"}, argv=["true"])
+
+
+# --------------------------------------------------------------------------
+# below= (output-destination folder prefix)
+# --------------------------------------------------------------------------
+
+
+@requires_blake3
+def test_below_prefixes_every_destination(graph):
+    job = ppg3.CommandJob(
+        outputs={"counts": "counts.tsv", "log": "align.log"},
+        argv=["true"],
+        below="samples/s1",
+    )
+    assert job.publish == {
+        "counts": "samples/s1/counts.tsv",
+        "log": "samples/s1/align.log",
+    }
+    # Publish-layer only (P1.4): entry layout / declared names unchanged.
+    assert job.output_names() == ["counts", "log"]
+    jd = job.job_def(graph)
+    assert jd["outputs_declared"] == ["counts", "log"]
+    assert jd["view"] == job.publish
+
+
+@requires_blake3
+def test_below_is_equivalent_to_writing_the_joined_paths(graph):
+    # `below=` must be indistinguishable from hand-joined destinations —
+    # same fingerprint, so the two definitions merge (P2.3).
+    a = ppg3.FileJob(outputs={"out": "x.txt"}, run=dummy_run, below="s1")
+    b = ppg3.FileJob(outputs={"out": "s1/x.txt"}, run=dummy_run)
+    assert a.id == b.id
+    assert a.label == b.label == "s1/x.txt"
+
+
+@requires_blake3
+def test_below_disambiguates_otherwise_contested_destinations(graph):
+    # Two per-sample instances of the same command publish the same file
+    # name under different folders — no P2 conflict.
+    ppg3.CommandJob(outputs={"out": "counts.tsv"}, argv=["true"], below="samples/s1")
+    ppg3.CommandJob(outputs={"out": "counts.tsv"}, argv=["true"], below="samples/s2")
+
+
+@requires_blake3
+def test_below_on_datajob_and_fetchjob(graph):
+    dj = ppg3.DataJob(outputs="model.pickle", run=dummy_run, below="fits")
+    assert dj.publish == {"data.pickle": "fits/model.pickle"}
+    fj = ppg3.FetchJob(
+        outputs="ref.fa",
+        url="https://example.invalid/ref.fa",
+        blake3="0" * 64,
+        below="incoming",
+    )
+    assert fj.publish == {"file": "incoming/ref.fa"}
+
+
+def test_below_rejects_absolute_and_traversal(graph):
+    with pytest.raises(DefinitionError):
+        ppg3.CommandJob(outputs={"a": "a.txt"}, argv=["true"], below="../escape")
+    with pytest.raises(DefinitionError):
+        ppg3.CommandJob(outputs={"a": "a.txt"}, argv=["true"], below="")
+    # A leading slash is tolerated only as sloppiness for a relative folder;
+    # "/" alone (empty after normalization) is rejected.
+    with pytest.raises(DefinitionError):
+        ppg3.CommandJob(outputs={"a": "a.txt"}, argv=["true"], below="/")

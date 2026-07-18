@@ -770,3 +770,123 @@ fn unknown_subcommand_is_a_usage_error() {
         .failure()
         .code(2);
 }
+
+#[test]
+fn why_answers_from_last_run_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (project_root, project_dir, _store) = setup_project(tmp.path());
+
+    let last_run = serde_json::json!({
+        "schema": 1,
+        "created_at_ms": 1,
+        "project_id": "p",
+        "generation": null,
+        "partial_dir": null,
+        "jobs": [
+            {
+                "label": "ok.txt",
+                "kind": "command",
+                "defsite": "/proj/pipeline.py:10",
+                "outputs": {"ok": "ok.txt"},
+                "status": "built",
+                "entry": "/store/v1/entries/abc/data"
+            },
+            {
+                "label": "bad.txt",
+                "kind": "command",
+                "defsite": "/proj/pipeline.py:20",
+                "outputs": {"bad": "bad.txt"},
+                "status": "failed",
+                "reason": "job \"x\" exited with code 7",
+                "exit_code": 7,
+                "failure_log": "/store/v1/logs/ik/failure.log"
+            },
+            {
+                "label": "results/leaf.txt",
+                "kind": "command",
+                "defsite": "/proj/pipeline.py:30",
+                "outputs": {"leaf": "results/leaf.txt"},
+                "status": "not_run",
+                "upstream": "bad.txt",
+                "reason": "did not run — upstream job bad.txt failed"
+            }
+        ]
+    });
+    std::fs::write(
+        project_dir.join("last_run.json"),
+        serde_json::to_vec_pretty(&last_run).unwrap(),
+    )
+    .unwrap();
+
+    // "why is this file missing" — a cascaded job resolves to its root
+    // cause, with both definition sites and the root's log path.
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .args(["why", "outputs/results/leaf.txt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "did not run — upstream job bad.txt failed",
+        ))
+        .stdout(predicate::str::contains("/proj/pipeline.py:30"))
+        .stdout(predicate::str::contains("root cause: bad.txt"))
+        .stdout(predicate::str::contains("/proj/pipeline.py:20"))
+        .stdout(predicate::str::contains("/store/v1/logs/ik/failure.log"))
+        .stdout(predicate::str::contains("in output tree: no"));
+
+    // Suffix match: the bare filename finds results/leaf.txt.
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .args(["why", "leaf.txt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("results/leaf.txt"));
+
+    // A failed job's own story names its reason/log.
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .args(["why", "bad.txt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("FAILED"))
+        .stdout(predicate::str::contains("exited with code 7"));
+
+    // No path: one status line per job.
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .args(["why"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("built"))
+        .stdout(predicate::str::contains(
+            "did not run (upstream bad.txt failed)",
+        ));
+
+    // Unknown path: says so, exit 1, offers close matches.
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .args(["why", "nope/leaf.txt"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("no job in the last run publishes"))
+        .stdout(predicate::str::contains("results/leaf.txt"));
+}
+
+#[test]
+fn why_without_last_run_points_at_running_the_pipeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (project_root, _project_dir, _store) = setup_project(tmp.path());
+    Command::cargo_bin("ppg3")
+        .unwrap()
+        .current_dir(&project_root)
+        .args(["why", "x.txt"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no last-run record"))
+        .stderr(predicate::str::contains("ppg3.run()"));
+}

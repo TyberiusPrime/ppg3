@@ -89,6 +89,18 @@ def _job_meta_from_graph(graph) -> Dict[str, Dict[str, str]]:
     return meta
 
 
+# The scheduler's cascade marker (core/src/scheduler.rs `fail_job`): a job
+# that never ran because a parent failed gets exactly this reason shape,
+# with the *internal id* of the immediate failed parent.
+_UPSTREAM_PREFIX = "upstream failed: "
+
+
+def _cascade_parent_id(reason: str) -> Optional[str]:
+    if reason.startswith(_UPSTREAM_PREFIX):
+        return reason[len(_UPSTREAM_PREFIX):].strip()
+    return None
+
+
 class RunResult:
     """The outcome of a :func:`run` call. ``built``/``hits``/``failed`` are
     keyed by job *label* (published destinations, or `<kind @ file:line>`
@@ -107,20 +119,50 @@ class RunResult:
         def _label(jid: str) -> str:
             return self.job_meta.get(jid, {}).get("label", jid)
 
+        raw_failed: Dict[str, str] = dict(report.get("failed", {}))
+
+        def _root_id(jid: str) -> str:
+            """Follow `upstream failed: <id>` chains to the job that
+            actually failed (the root cause). Cycle/missing-id safe."""
+            seen = {jid}
+            cur = jid
+            while True:
+                parent = _cascade_parent_id(raw_failed.get(cur, ""))
+                if parent is None:
+                    return cur
+                if parent in seen or parent not in raw_failed:
+                    return parent
+                seen.add(parent)
+                cur = parent
+
+        # label -> root-cause label, for every job that did not run because
+        # an upstream (transitively) failed. Basis for the aggregated
+        # "did not run" section of format_failures and for `ppg3 why`.
+        self.upstream_failed: Dict[str, str] = {}
+        translated_failed: Dict[str, str] = {}
+        for jid, reason in raw_failed.items():
+            if _cascade_parent_id(reason) is not None:
+                root = _root_id(jid)
+                self.upstream_failed[_label(jid)] = _label(root)
+                reason = f"did not run — upstream job {_label(root)} failed"
+            translated_failed[_label(jid)] = reason
         self.built: List[str] = sorted(_label(j) for j in report.get("built", []))
         self.hits: List[str] = sorted(_label(j) for j in report.get("hits", []))
-        self.failed: Dict[str, str] = {
-            _label(j): reason for j, reason in report.get("failed", {}).items()
-        }
+        self.failed: Dict[str, str] = translated_failed
         # label -> {"reason", "log_dir", "failure_log", "exit_code",
-        # "out_dir", "runtime_ms", "kind", "defsite"} (see the Rust
-        # `FailedJob`, enriched with graph metadata).
+        # "out_dir", "runtime_ms", "missing_outputs", "kind", "defsite",
+        # "upstream"} (see the Rust `FailedJob`, enriched with graph
+        # metadata and the resolved cascade root).
         self.failed_details: Dict[str, Dict[str, Any]] = {}
         for jid, detail in dict(report.get("failed_details", {})).items():
             enriched = dict(detail)
             enriched["kind"] = self.job_meta.get(jid, {}).get("kind", "")
             enriched["defsite"] = self.job_meta.get(jid, {}).get("defsite", "")
-            self.failed_details[_label(jid)] = enriched
+            label = _label(jid)
+            if label in self.upstream_failed:
+                enriched["upstream"] = self.upstream_failed[label]
+                enriched["reason"] = translated_failed[label]
+            self.failed_details[label] = enriched
         self.job_entries: Dict[str, Any] = {
             _label(j): v for j, v in dict(report.get("job_entries", {})).items()
         }
@@ -143,23 +185,29 @@ class RunResult:
 
     def format_failures(self) -> str:
         """Human-readable, per-job failure report (PRINCIPLES.md P9: every
-        failure names its artifacts). One block per failed job: ``Job`` /
-        ``Defined`` / ``Runtime`` / ``Exit`` (only for CommandJobs) /
-        ``Exception`` (wrapped) / ``Log`` / ``Outputs`` / ``Kept``. Plain
-        text, no third-party deps — what :class:`PPGRunError` renders."""
-        names = sorted(self.failed)
-        if not names:
+        failure names its artifacts). One block per *actually failed* job:
+        ``Job`` / ``Defined`` / ``Runtime`` / ``Exit`` (only for
+        CommandJobs) / ``Exception`` (wrapped) / ``Missing`` / ``Log`` /
+        ``Outputs`` / ``Kept``. Jobs that merely never ran because an
+        upstream failed are aggregated into one compact "did not run"
+        section, grouped by root cause — they are casualties, not stories
+        of their own. Plain text, no third-party deps — what
+        :class:`PPGRunError` renders."""
+        names = sorted(n for n in self.failed if n not in self.upstream_failed)
+        if not names and not self.upstream_failed:
             return "no failed jobs"
-        # When exactly one job failed, the log *is* the story: inline its
-        # full consolidated log so the user reads the whole traceback right
-        # here instead of opening the file the `Log:` field points at. In
-        # that case the per-job block drops its truncated stderr tail, since
-        # the full log (which includes stderr) follows in its entirety.
+        # When exactly one job actually failed, the log *is* the story:
+        # inline its full consolidated log so the user reads the whole
+        # traceback right here instead of opening the file the `Log:` field
+        # points at. In that case the per-job block drops its truncated
+        # stderr tail, since the full log (which includes stderr) follows
+        # in its entirety.
         full = self._read_failure_log(names[0]) if len(names) == 1 else ""
         blocks = [self._format_one_failure(name, inline_tail=not full) for name in names]
         text = f"{len(names)} job(s) failed:\n\n" + "\n\n".join(blocks)
         if full:
             text += "\n\n--- full log ---\n" + full
+        text += self._format_upstream_casualties()
         if self.partial_dir:
             text += (
                 f"\n\nPartial results: {self.partial_dir}\n"
@@ -167,6 +215,28 @@ class RunResult:
                 "the current generation is untouched)"
             )
         return text
+
+    def _format_upstream_casualties(self) -> str:
+        """The aggregated "did not run" section: cascaded jobs grouped by
+        the root failure that took them down. ``""`` when there are none."""
+        if not self.upstream_failed:
+            return ""
+        by_root: Dict[str, List[str]] = {}
+        for label, root in self.upstream_failed.items():
+            by_root.setdefault(root, []).append(label)
+        lines = [
+            "",
+            "",
+            f"{len(self.upstream_failed)} more job(s) did not run because an "
+            "upstream failed:",
+        ]
+        for root in sorted(by_root):
+            victims = sorted(by_root[root])
+            shown = ", ".join(victims[:10])
+            if len(victims) > 10:
+                shown += f" (+{len(victims) - 10} more)"
+            lines.append(f"  because {root} failed: {shown}")
+        return "\n".join(lines)
 
     def _format_one_failure(self, name: str, inline_tail: bool = True) -> str:
         detail = self.failed_details.get(name, {})
@@ -197,6 +267,13 @@ class RunResult:
         exc = _last_meaningful_line(reason)
         if exc:
             self._wrapped_field(lines, "Exception", exc)
+
+        # Output-contract failures: name the declared outputs the job never
+        # wrote (the entry path with what it *did* write follows as
+        # Outputs/Kept below).
+        missing = detail.get("missing_outputs") or []
+        if missing:
+            self._wrapped_field(lines, "Missing", ", ".join(missing))
 
         # P9.2/P9.3: the job's own words are the evidence — inline the
         # stderr tail (which for e.g. a fetch mismatch carries the url,
@@ -409,6 +486,96 @@ def _write_partial_tree(graph, report, core, handle, partial_dir: str) -> bool:
     if not made:
         shutil.rmtree(partial_dir, ignore_errors=True)
     return made
+
+
+def _entry_data_dirs(graph, report, core, handle) -> Dict[str, str]:
+    """id -> absolute ``entries/<oh>/data`` path, for every job the run
+    report recorded a published entry for (hit or built — and failed jobs
+    whose entry was still published, P8)."""
+    dirs: Dict[str, str] = {}
+    for jid, entry in dict(report.get("job_entries", {})).items():
+        ik, _oh = entry
+        looked = core.lookup(handle, ik)
+        if looked is None:
+            continue
+        info = json.loads(looked)
+        store = graph.stores[info["store_index"]]
+        dirs[jid] = os.path.join(
+            os.path.abspath(store.path), "v1", "entries", info["output_hash"], "data"
+        )
+    return dirs
+
+
+def _write_last_run(
+    graph, result: "RunResult", report: Dict[str, Any], core, handle, project_id: str
+) -> None:
+    """``<project_dir>/last_run.json`` — the per-job story of the most
+    recent run, in user terms (labels, definition sites, publish paths;
+    P1.5). This is what lets `ppg3 why <path>` answer "why did this job
+    not run?" / "why is this file missing from the output tree?" after the
+    Python process is gone. Pointer/cache state per P3 (derived, freely
+    regenerated by the next run); best-effort — a reporting hiccup must
+    never fail the run itself."""
+    import time
+
+    built_ids = set(report.get("built", []))
+    hit_ids = set(report.get("hits", []))
+    raw_failed = dict(report.get("failed", {}))
+    entry_dirs = _entry_data_dirs(graph, report, core, handle)
+
+    jobs: List[Dict[str, Any]] = []
+    for jid, job in graph.jobs.items():
+        meta = result.job_meta.get(jid, {})
+        label = meta.get("label", jid)
+        rec: Dict[str, Any] = {
+            "label": label,
+            "kind": meta.get("kind", ""),
+            "defsite": meta.get("defsite", ""),
+            "outputs": dict(getattr(job, "publish", {}) or {}),
+        }
+        if jid in built_ids:
+            rec["status"] = "built"
+        elif jid in hit_ids:
+            rec["status"] = "hit"
+        elif jid in raw_failed:
+            detail = result.failed_details.get(label, {})
+            upstream = detail.get("upstream")
+            if upstream is not None:
+                rec["status"] = "not_run"
+                rec["upstream"] = upstream
+            else:
+                rec["status"] = "failed"
+                for k in ("failure_log", "log_dir", "exit_code", "missing_outputs"):
+                    if detail.get(k):
+                        rec[k] = detail[k]
+                if detail.get("out_dir"):
+                    rec["out_dir"] = detail["out_dir"]
+            rec["reason"] = result.failed.get(label, raw_failed[jid])
+        else:
+            # Never dispatched (abort mid-run) — absent from every list.
+            rec["status"] = "not_reached"
+        if jid in entry_dirs:
+            rec["entry"] = entry_dirs[jid]
+        jobs.append(rec)
+
+    payload = {
+        "schema": 1,
+        "created_at_ms": int(time.time() * 1000),
+        "project_id": project_id,
+        "generation": result.generation,
+        "partial_dir": result.partial_dir,
+        "jobs": jobs,
+    }
+    try:
+        os.makedirs(graph.project_dir, exist_ok=True)
+        path = os.path.join(graph.project_dir, "last_run.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def _write_project_config(graph: Graph) -> None:
@@ -656,14 +823,14 @@ def run(
         # job's outputs into a browsable partial tree (marked by its name
         # and location; never `current`, see P8.3) and say where it is.
         made = _write_partial_tree(graph, report, core, handle, partial_dir)
-        raise PPGRunError(
-            RunResult(
-                report,
-                generation=None,
-                job_meta=job_meta,
-                partial_dir=partial_dir if made else None,
-            )
+        result = RunResult(
+            report,
+            generation=None,
+            job_meta=job_meta,
+            partial_dir=partial_dir if made else None,
         )
+        _write_last_run(graph, result, report, core, handle, project_id)
+        raise PPGRunError(result)
     # A stale partial tree from an earlier failed run would misrepresent
     # this (successful) state — drop it.
     import shutil as _shutil
@@ -736,4 +903,6 @@ def run(
         vcs_json,
     )
     _last_run_info["generation"] = generation
-    return RunResult(report, generation=generation, job_meta=job_meta)
+    result = RunResult(report, generation=generation, job_meta=job_meta)
+    _write_last_run(graph, result, report, core, handle, project_id)
+    return result

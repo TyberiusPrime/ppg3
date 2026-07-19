@@ -19,6 +19,10 @@ page (no build step, ships inside the wheel). The server binds
 - ``GET /``            the status page
 - ``GET /api/state``   full state snapshot as JSON
 - ``GET /api/events``  SSE stream; every message is a full snapshot
+- ``GET /source``      line-numbered view of one referenced file
+  (``?path=<abs>``, ``#L<n>`` highlights a line) — restricted to the
+  files the state itself names (script, watched paths, ``Defined:``
+  frames, failure logs, kept files; see ``WatchState.browsable_file``)
 
 Full-snapshot SSE messages (rather than deltas) are deliberate: the state
 is small (run history is bounded at ``_HISTORY_LIMIT``), reconnects are
@@ -41,6 +45,7 @@ redundant one.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import queue
@@ -48,9 +53,10 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, IO, List, Optional, Sequence
+from typing import Any, Callable, Dict, IO, List, Optional, Sequence, Set
+from urllib.parse import parse_qs, urlsplit
 
-from .run import _last_meaningful_line, get_last_run_info
+from .run import RunResult, _last_meaningful_line, get_last_run_info
 from .watch import WatchEvent, _print, _timestamp, run_watch
 
 # Bounded per-pass history kept in memory (and shipped in every snapshot).
@@ -60,6 +66,10 @@ _HISTORY_LIMIT = 50
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
+
+# `/source` serves at most this much of a file (a failure log can be huge;
+# the page says so and points at the on-disk path for the rest).
+_SOURCE_BYTE_LIMIT = 2 * 1024 * 1024
 
 
 def _counts(report: Optional[Dict[str, Any]]) -> Optional[Dict[str, int]]:
@@ -89,11 +99,20 @@ def _empty_live() -> Dict[str, Any]:
     }
 
 
+def _kept_files(out_dir: Optional[str]) -> List[str]:
+    """The failed job's leftovers (same list the CLI's ``Kept:`` fields
+    show — ``RunResult._kept_files``); ``[]`` for no/empty/missing dir."""
+    if not out_dir:
+        return []
+    return RunResult._kept_files(out_dir)
+
+
 def _failure_records(event: WatchEvent) -> List[Dict[str, Any]]:
     """Flatten a ``pass_run_failed`` event's RunResult attributes into one
     self-contained record per failed job — the same fields
-    ``RunResult._format_one_failure`` renders (job/runtime/exit/exception/
-    log/outputs), plus the full ``reason`` blob for the drill-down view."""
+    ``RunResult._format_one_failure`` renders (job/defined/runtime/exit/
+    exception/missing/log/outputs/kept), plus the full ``reason`` blob for
+    the drill-down view."""
     failed: Dict[str, str] = event.get("failed") or {}
     details: Dict[str, Dict[str, Any]] = event.get("failed_details") or {}
     kinds: Dict[str, str] = event.get("job_kinds") or {}
@@ -102,21 +121,44 @@ def _failure_records(event: WatchEvent) -> List[Dict[str, Any]]:
         detail = details.get(job_id) or {}
         reason = detail.get("reason") or failed.get(job_id, "")
         exit_code = detail.get("exit_code")
+        kind = detail.get("kind") or kinds.get(job_id)
+        out_dir = detail.get("out_dir")
         records.append(
             {
                 "job": job_id,
-                "kind": kinds.get(job_id),
+                "kind": kind,
+                "defsite": detail.get("defsite") or None,
                 "exception": _last_meaningful_line(reason),
                 "reason": reason,
+                "missing": detail.get("missing_outputs") or [],
                 "runtime_ms": detail.get("runtime_ms"),
                 # Same CommandJob-only rule as RunResult._format_one_failure:
                 # a FileJob's exit code is always 1 and meaningless.
-                "exit_code": exit_code if kinds.get(job_id) == "command" else None,
+                "exit_code": exit_code if kind == "command" else None,
                 "log": detail.get("failure_log") or detail.get("log_dir"),
-                "out_dir": detail.get("out_dir"),
+                "out_dir": out_dir,
+                "kept": _kept_files(out_dir),
             }
         )
     return records
+
+
+def _defsite_paths(defsite: str) -> List[str]:
+    """The file paths a ``file:line ← file:line`` defsite chain
+    (``jobs._format_defsite``) names — the ``/source`` allowlist feed."""
+    paths = []
+    for frame in (defsite or "").split(" ← "):
+        base, sep, line = frame.strip().rpartition(":")
+        if sep and base and line.isdigit():
+            paths.append(base)
+    return paths
+
+
+def _default_job_meta() -> Dict[str, Dict[str, str]]:
+    """The running (or most recent) run's internal-id -> label/kind/defsite
+    map — like the events path, ``ppg3.run()`` records it *before* the run
+    starts so live events can be translated while jobs still execute."""
+    return get_last_run_info().get("job_meta") or {}
 
 
 class WatchState:
@@ -128,10 +170,23 @@ class WatchState:
     threads — everything mutable sits behind one lock. The state dict is
     only ever exposed as a JSON string, so handler threads can never
     observe (or mutate) a half-updated structure.
+
+    ``job_meta_provider`` translates the event log's internal job ids into
+    user terms (P1.5): it returns the ``id -> {"label", "kind",
+    "defsite"}`` map ``ppg3.run()`` stashes in the last-run-info slot
+    before each run. Injectable for tests; an id the map does not know
+    (e.g. a GraphJob-expanded job mid-run) just renders by id.
     """
 
-    def __init__(self, script: str, interval: float, history_limit: int = _HISTORY_LIMIT):
+    def __init__(
+        self,
+        script: str,
+        interval: float,
+        history_limit: int = _HISTORY_LIMIT,
+        job_meta_provider: Optional[Callable[[], Dict[str, Dict[str, str]]]] = None,
+    ):
         self._lock = threading.Lock()
+        self._job_meta_provider = job_meta_provider or _default_job_meta
         self._subscribers: List["queue.Queue[str]"] = []
         self._history_limit = history_limit
         self._state: Dict[str, Any] = {
@@ -209,6 +264,14 @@ class WatchState:
         not a thousand."""
         if not events:
             return
+        try:
+            meta = self._job_meta_provider() or {}
+        except Exception:
+            meta = {}
+
+        def _meta(event: Dict[str, Any], field: str) -> Optional[str]:
+            return meta.get(event.get("job") or "", {}).get(field) or None
+
         with self._lock:
             live = self._state["live"]
             for event in events:
@@ -223,6 +286,7 @@ class WatchState:
                     live["jobs"][event.get("job")] = {
                         "status": "running",
                         "outcome": None,
+                        "label": _meta(event, "label"),
                         "started_ms": ts,
                         "runtime_ms": None,
                     }
@@ -233,6 +297,7 @@ class WatchState:
                     )
                     job["status"] = "done"
                     job["outcome"] = event.get("outcome")
+                    job["label"] = _meta(event, "label") or job.get("label")
                     if job.get("started_ms") is not None and ts is not None:
                         job["runtime_ms"] = ts - job["started_ms"]
                     if event.get("total"):
@@ -244,12 +309,23 @@ class WatchState:
                         event.get("job"),
                         {"status": None, "outcome": None, "started_ms": None, "runtime_ms": None},
                     )
+                    kind = _meta(event, "kind")
                     job["status"] = "failed"
                     job["reason"] = reason
                     job["exception"] = _last_meaningful_line(reason)
+                    job["label"] = _meta(event, "label") or job.get("label")
+                    job["defsite"] = _meta(event, "defsite")
+                    job["kind"] = kind
+                    job["missing"] = detail.get("missing_outputs") or []
                     job["log"] = detail.get("failure_log") or detail.get("log_dir")
                     job["out_dir"] = detail.get("out_dir")
-                    job["exit_code"] = detail.get("exit_code")
+                    job["kept"] = _kept_files(detail.get("out_dir"))
+                    # Suppress the meaningless non-CommandJob exit code only
+                    # when the kind is actually known (no meta -> show it).
+                    exit_code = detail.get("exit_code")
+                    job["exit_code"] = (
+                        exit_code if kind in (None, "command") else None
+                    )
                     if detail.get("runtime_ms") is not None:
                         job["runtime_ms"] = detail["runtime_ms"]
                     elif job.get("started_ms") is not None and ts is not None:
@@ -293,6 +369,27 @@ class WatchState:
     def snapshot_json(self) -> str:
         with self._lock:
             return json.dumps(self._state)
+
+    def browsable_file(self, path: str) -> bool:
+        """Whether the read-only ``/source`` endpoint may serve ``path``:
+        exactly the files the current state itself references — the
+        pipeline script, the watched paths, every defsite frame, and each
+        failure's log / kept files. Nothing else: the server should not be
+        a general local-file oracle, localhost-only or not."""
+        want = os.path.abspath(path)
+        with self._lock:
+            allowed: Set[str] = {self._state["script"]}
+            allowed.update(self._state.get("watched_paths") or [])
+            records: List[Dict[str, Any]] = []
+            for run in self._state["runs"]:
+                records.extend(run.get("failures") or [])
+            records.extend(self._state["live"]["jobs"].values())
+            for rec in records:
+                allowed.update(_defsite_paths(rec.get("defsite") or ""))
+                if rec.get("log"):
+                    allowed.add(rec["log"])
+                allowed.update(rec.get("kept") or [])
+        return want in {os.path.abspath(p) for p in allowed}
 
     def _broadcast_locked(self) -> None:
         payload = json.dumps(self._state)
@@ -445,6 +542,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(200, "application/json", body)
         elif path == "/api/events":
             self._serve_events()
+        elif path == "/source":
+            self._serve_source()
         else:
             self._respond(404, "text/plain; charset=utf-8", b"not found\n")
 
@@ -455,6 +554,31 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_source(self) -> None:
+        """``GET /source?path=<abs path>[#L<n>]``: a read-only, line-
+        numbered view of one file the status page references (a ``Defined:``
+        frame, a watched path, a failure log, a kept file). Anything not on
+        :meth:`WatchState.browsable_file`'s allowlist — or unreadable — is
+        a plain 404, indistinguishable from a file that does not exist."""
+        query = parse_qs(urlsplit(self.path).query)
+        target = (query.get("path") or [None])[0]
+        if (
+            not target
+            or not self.server.watch_state.browsable_file(target)
+            or not os.path.isfile(target)
+        ):
+            self._respond(404, "text/plain; charset=utf-8", b"not found\n")
+            return
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(_SOURCE_BYTE_LIMIT + 1)
+        except OSError:
+            self._respond(404, "text/plain; charset=utf-8", b"not found\n")
+            return
+        truncated = len(text) > _SOURCE_BYTE_LIMIT
+        body = _source_page(target, text[:_SOURCE_BYTE_LIMIT], truncated)
+        self._respond(200, "text/html; charset=utf-8", body.encode("utf-8"))
 
     def _serve_events(self) -> None:
         """One SSE connection: initial snapshot immediately (the queue is
@@ -541,6 +665,66 @@ def run_webwatch(
 
 
 # ---------------------------------------------------------------------------
+# /source: server-rendered read-only file view. Each line is an anchor
+# (`#L41`), so a `Defined: file.py:41` link lands on — and CSS `:target`
+# highlights — the exact line; line numbers self-link for sharing.
+# ---------------------------------------------------------------------------
+
+_SOURCE_CSS = """
+  :root { --bg: #ffffff; --fg: #1a1d21; --muted: #667085; --line: #e4e7ec;
+          --accent: #2563eb; --hit: #fef3c7; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #101418; --fg: #e6e9ec; --muted: #8b98a5; --line: #2a3138;
+            --accent: #60a5fa; --hit: #3a2f10; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { position: sticky; top: 0; background: var(--bg); padding: .7rem 1rem;
+           border-bottom: 1px solid var(--line); word-break: break-all;
+           font-family: ui-sans-serif, system-ui, sans-serif; font-size: .85rem; }
+  header a { color: var(--accent); text-decoration: none; }
+  header a:hover { text-decoration: underline; }
+  header .path { color: var(--muted); }
+  .code { padding: .5rem 0 3rem; }
+  .line { display: flex; text-decoration: none; color: inherit; }
+  .line:hover { background: var(--line); }
+  .line:target { background: var(--hit); }
+  .ln { flex: 0 0 4.5em; padding-right: 1em; text-align: right;
+        color: var(--muted); user-select: none; }
+  .src { white-space: pre; }
+  .trunc { padding: 1rem; color: var(--muted);
+           font-family: ui-sans-serif, system-ui, sans-serif; }
+"""
+
+
+def _source_page(path: str, text: str, truncated: bool) -> str:
+    rows = []
+    for n, line in enumerate(text.split("\n"), start=1):
+        rows.append(
+            f'<a class="line" id="L{n}" href="#L{n}">'
+            f'<span class="ln">{n}</span>'
+            f'<span class="src">{html.escape(line)}</span></a>'
+        )
+    notice = (
+        f'<div class="trunc">truncated at {_SOURCE_BYTE_LIMIT} bytes — the '
+        f"full file is at {html.escape(path)}</div>"
+        if truncated
+        else ""
+    )
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{html.escape(os.path.basename(path))} — ppg3 webwatch</title>"
+        f"<style>{_SOURCE_CSS}</style></head><body>"
+        '<header><a href="/">&larr; webwatch</a> '
+        f'<span class="path">{html.escape(path)}</span></header>'
+        f'<div class="code">{"".join(rows)}</div>{notice}'
+        "</body></html>"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The page. One self-contained document: no external assets (works with any
 # network policy, no build step), vanilla JS, EventSource with its built-in
 # auto-reconnect, full re-render per snapshot (expanded rows are re-applied
@@ -621,6 +805,10 @@ _PAGE_HTML = """<!DOCTYPE html>
   .failure .meta { color: var(--muted); font-size: .8rem; margin: .15rem 0; }
   .failure .exc { margin: .25rem 0; word-break: break-word; }
   .failure .path { font-size: .8rem; word-break: break-all; }
+  .failure .missing { margin: .25rem 0; color: var(--failed); font-size: .85rem;
+                      word-break: break-word; }
+  a.srclink { color: var(--accent); text-decoration: none; }
+  a.srclink:hover { text-decoration: underline; }
   pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
         padding: .6rem; overflow-x: auto; font-size: .78rem; max-height: 24rem; }
   details.sub > summary { cursor: pointer; color: var(--muted); font-size: .8rem; }
@@ -692,17 +880,40 @@ function sub(key, summary, inner) {
          `<summary>${summary}</summary>${inner}</details>`;
 }
 
+// /source links: the server only serves files the state itself references
+// (see WatchState.browsable_file); `line` becomes a `#L<n>` anchor the
+// source page highlights and scrolls to.
+function srcLink(file, line, text) {
+  const href = "/source?path=" + encodeURIComponent(file) + (line ? "#L" + line : "");
+  return `<a class="srclink mono" href="${href}">${esc(text ?? file)}</a>`;
+}
+
+// A defsite chain ("file.py:41 ← helper.py:7"): every frame links into
+// the source view at its line.
+function defsiteHtml(ds) {
+  return String(ds || "").split(" \\u2190 ").map(frame => {
+    const m = frame.match(/^(.*):(\\d+)$/);
+    return m ? srcLink(m[1], m[2], frame) : esc(frame);
+  }).join(" \\u2190 ");
+}
+
 function failureHtml(f, keyPrefix) {
   const meta = [];
   if (f.runtime_ms != null) meta.push("runtime " + fmtDur(f.runtime_ms));
   if (f.exit_code != null) meta.push("exit " + esc(f.exit_code));
   if (f.kind) meta.push(esc(f.kind) + " job");
   return `<div class="failure">
-    <div class="job mono">${esc(f.job)}</div>
+    <div class="job mono">${esc(f.label || f.job)}</div>
+    ${f.defsite ? `<div class="path">defined: ${defsiteHtml(f.defsite)}</div>` : ""}
     ${meta.length ? `<div class="meta">${meta.join(" &middot; ")}</div>` : ""}
     ${f.exception ? `<div class="exc mono">${esc(f.exception)}</div>` : ""}
-    ${f.log ? `<div class="path">log: <span class="mono">${esc(f.log)}</span></div>` : ""}
+    ${f.missing && f.missing.length
+      ? `<div class="missing">missing declared output(s): <span class="mono">${
+          f.missing.map(esc).join(", ")}</span> &mdash; never written to /ppg/out/&lt;name&gt;</div>`
+      : ""}
+    ${f.log ? `<div class="path">log: ${srcLink(f.log)}</div>` : ""}
     ${f.out_dir ? `<div class="path">outputs: <span class="mono">${esc(f.out_dir)}</span></div>` : ""}
+    ${(f.kept || []).map(k => `<div class="path">kept: ${srcLink(k)}</div>`).join("")}
     ${f.reason && f.reason.trim() !== (f.exception || "").trim()
       ? sub(`${keyPrefix}:${f.job}:reason`, "full reason", `<pre>${esc(f.reason)}</pre>`)
       : ""}
@@ -720,12 +931,12 @@ function liveHtml(live) {
   const done = jobs.filter(j => j.status === "done");
   const runningRows = running.map(j => `<div class="liverow">
       <span class="badge running">running</span>
-      <span class="mono">${esc(j.job)}</span>
+      <span class="mono">${esc(j.label || j.job)}</span>
       <span class="elapsed">${j.started_ms ? fmtDur(Math.max(Date.now() - j.started_ms, 0)) : ""}</span>
     </div>`).join("");
   const doneRows = done.map(j => `<div class="liverow">
       <span class="badge ok">${esc(j.outcome || "done")}</span>
-      <span class="mono">${esc(j.job)}</span>
+      <span class="mono">${esc(j.label || j.job)}</span>
       <span class="elapsed">${fmtDur(j.runtime_ms)}</span>
     </div>`).join("");
   return `<div class="livebox">
@@ -774,6 +985,10 @@ function runHtml(r) {
         ? `<h3>${r.failures.length} failed job(s) — view left unchanged</h3>` +
           r.failures.map(f => failureHtml(f, `run${r.n}`)).join("")
         : ""}
+      ${r.failures_text
+        ? sub(`run${r.n}:report`, "full report (CLI format)",
+              `<pre>${esc(r.failures_text)}</pre>`)
+        : ""}
       ${r.traceback
         ? `<h3>definition pass traceback</h3><pre>${esc(r.traceback)}</pre>` : ""}
       ${r.status === "ok"
@@ -788,14 +1003,14 @@ function render(state) {
   const st = $("status");
   st.textContent = state.status;
   st.className = "badge " + state.status;
-  $("script").textContent = state.script;
+  $("script").innerHTML = srcLink(state.script);
   document.title = `ppg3 webwatch — ${state.status}`;
   $("totals").textContent =
     `${state.n_runs} run(s), ${state.n_failures} failure(s), ` +
     `interval ${state.interval}s`;
   $("watchedcount").textContent = state.watched_paths.length;
   $("watched").innerHTML =
-    state.watched_paths.map(p => `<li>${esc(p)}</li>`).join("");
+    state.watched_paths.map(p => `<li>${srcLink(p)}</li>`).join("");
   $("watchedbox").open = watchedOpen;
   $("livebox").innerHTML = state.live ? liveHtml(state.live) : "";
   $("runs").innerHTML = state.runs.length

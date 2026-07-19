@@ -112,9 +112,19 @@ The page live-updates (no reloading) and shows:
   changes), the watched-path set, and total run/failure counts;
 - a history of recent passes — which paths triggered each one, how long it
   took, built/hit/failed counts, and the generation it wrote;
-- for failed runs, a per-job drill-down: the exception summary, runtime,
-  exit code, the failure-log and staged-output paths to inspect, and the
-  full error report; for a broken pipeline script, the Python traceback.
+- for failed runs, a per-job drill-down with the same fields the console
+  report prints: where the job was **defined** (`file.py:41`), the
+  exception summary, runtime, exit code, any **missing declared
+  outputs**, the failure-log and staged-output paths, whatever the failed
+  job left behind (**kept** files), and the full error report — plus the
+  verbatim CLI-format report under "full report"; for a broken pipeline
+  script, the Python traceback.
+
+Everything that names a file is a link: the `defined:` frames open a
+line-numbered **source view** with the defining line highlighted, and
+failure logs / kept files open the same way. The viewer (`GET
+/source?path=...`) serves only files the status page itself references —
+it is not a general file browser.
 
 Under the hood the scheduler writes a small JSONL event log per run
 (`.ppg3/run-events-*.jsonl`, one line per job start/finish/failure) and

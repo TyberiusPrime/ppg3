@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
@@ -137,6 +138,42 @@ def test_watchstate_run_failed_flattens_failure_records():
     assert rec_b["reason"] == "also boom"  # falls back to `failed` value
     assert rec_b["exit_code"] is None  # file job: exit code suppressed
     assert rec_b["log"] is None
+
+
+def test_failure_records_carry_defsite_missing_and_kept(tmp_path):
+    # The real post-fix event shape: no job_kinds — kind/defsite ride
+    # inside failed_details (RunResult's graph enrichment), and the CLI's
+    # Missing:/Kept: fields must survive into the web record.
+    out_dir = tmp_path / "data"
+    out_dir.mkdir()
+    (out_dir / "out.txt").write_text("hello\n")
+    state = WatchState("p.py", 0.5)
+    state.handle_event(_started(1))
+    state.handle_event(
+        {
+            "type": "pass_run_failed",
+            "ts": 1001.0,
+            "report": {"built": [], "hits": [], "failed": {"out.txt": "..."}},
+            "failed": {"out.txt": 'cached entry is missing declared output(s) "shu"'},
+            "failed_details": {
+                "out.txt": {
+                    "reason": 'cached entry is missing declared output(s) "shu"',
+                    "missing_outputs": ["shu"],
+                    "out_dir": str(out_dir),
+                    "kind": "file",
+                    "defsite": "/home/u/pipeline.py:41",
+                    "exit_code": 1,
+                }
+            },
+            "failures_text": "1 job(s) failed: ...",
+        }
+    )
+    (rec,) = _state_dict(state)["runs"][0]["failures"]
+    assert rec["defsite"] == "/home/u/pipeline.py:41"
+    assert rec["missing"] == ["shu"]
+    assert rec["kept"] == [str(out_dir / "out.txt")]
+    assert rec["kind"] == "file"
+    assert rec["exit_code"] is None  # non-command kind from the detail itself
 
 
 def test_watchstate_definition_exception():
@@ -352,6 +389,67 @@ def test_http_sse_stream_initial_snapshot_then_live_update(served_state):
         assert second["runs"][0]["n"] == 1
     finally:
         resp.close()
+
+
+def test_http_source_serves_only_state_referenced_files(served_state, tmp_path):
+    state, base = served_state
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not serve\n")
+    src = tmp_path / "pipe.py"
+    src.write_text("line one\nline <two> & three\n")
+
+    def source_url(p):
+        return base + "/source?path=" + urllib.parse.quote(str(p), safe="")
+
+    # Not referenced by any state: 404, even though the file exists.
+    for url in (source_url(secret), base + "/source"):
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _get(url)
+        assert excinfo.value.code == 404
+
+    # A watched path becomes browsable...
+    state.handle_event(
+        {"type": "waiting", "ts": 1.0, "watched_paths": [str(src)]}
+    )
+    status, body = _get(source_url(src))
+    assert status == 200
+    text = body.decode("utf-8")
+    assert 'id="L2"' in text  # per-line anchors for #L<n> links
+    assert "line &lt;two&gt; &amp; three" in text  # HTML-escaped content
+    # ...but the sibling still is not.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _get(source_url(secret))
+    assert excinfo.value.code == 404
+
+
+def test_http_source_allows_defsite_and_log_from_failures(served_state, tmp_path):
+    state, base = served_state
+    defsite_file = tmp_path / "pipeline.py"
+    defsite_file.write_text("x = 1\n")
+    log = tmp_path / "failure.log"
+    log.write_text("traceback...\n")
+    state.handle_event(_started(1))
+    state.handle_event(
+        {
+            "type": "pass_run_failed",
+            "ts": 2.0,
+            "report": {"failed": {"a": "boom"}},
+            "failed": {"a": "boom"},
+            "failed_details": {
+                "a": {
+                    "reason": "boom",
+                    "defsite": f"{defsite_file}:1",
+                    "failure_log": str(log),
+                }
+            },
+            "failures_text": "1 job(s) failed",
+        }
+    )
+    for p in (defsite_file, log):
+        status, _body = _get(
+            base + "/source?path=" + urllib.parse.quote(str(p), safe="")
+        )
+        assert status == 200
 
 
 # --------------------------------------------------------------------------
@@ -586,6 +684,68 @@ def test_live_state_failure_carries_detail_immediately():
     down = live["jobs"]["downstream"]
     assert down["status"] == "failed"
     assert down["reason"] == "upstream failed: boom"
+
+
+def test_live_failure_joins_job_meta_and_missing_outputs(tmp_path):
+    # The event log speaks internal ids; ppg3.run() stashes an id ->
+    # label/kind/defsite map before the run starts (last-run-info slot) and
+    # WatchState joins it so live failures render like the CLI's block.
+    out_dir = tmp_path / "data"
+    out_dir.mkdir()
+    (out_dir / "out.txt").write_text("x")
+    meta = {
+        "j123": {"label": "out.txt", "kind": "file", "defsite": "/x/p.py:41"},
+    }
+    state = WatchState("p.py", 0.5, job_meta_provider=lambda: meta)
+    state.handle_runner_events(
+        [
+            _runner("run_started", run_id="r", total=1, ts_ms=1),
+            _runner("job_started", job="j123", ts_ms=2),
+            _runner(
+                "job_failed",
+                job="j123",
+                reason='cached entry is missing declared output(s) "shu"',
+                detail={
+                    "reason": 'cached entry is missing declared output(s) "shu"',
+                    "missing_outputs": ["shu"],
+                    "out_dir": str(out_dir),
+                    "exit_code": 1,
+                },
+                total=1,
+                ts_ms=3,
+            ),
+        ]
+    )
+    job = _state_dict(state)["live"]["jobs"]["j123"]
+    assert job["label"] == "out.txt"
+    assert job["defsite"] == "/x/p.py:41"
+    assert job["kind"] == "file"
+    assert job["missing"] == ["shu"]
+    assert job["kept"] == [str(out_dir / "out.txt")]
+    assert job["exit_code"] is None  # known non-command kind: suppressed
+
+
+def test_live_failure_without_meta_keeps_exit_code_and_id():
+    # No meta (e.g. a GraphJob-expanded job mid-run): render by id, keep
+    # the exit code (kind unknown — better shown than wrongly hidden).
+    state = WatchState("p.py", 0.5, job_meta_provider=lambda: {})
+    state.handle_runner_events(
+        [
+            _runner("run_started", run_id="r", total=1, ts_ms=1),
+            _runner(
+                "job_failed",
+                job="jXYZ",
+                reason="boom",
+                detail={"reason": "boom", "exit_code": 2},
+                total=1,
+                ts_ms=2,
+            ),
+        ]
+    )
+    job = _state_dict(state)["live"]["jobs"]["jXYZ"]
+    assert job.get("label") is None
+    assert job["exit_code"] == 2
+    assert job["missing"] == []
 
 
 def test_live_state_new_run_resets():

@@ -20,3 +20,6 @@ result-*
 !core/
 !core/**
 test/
+docs/public/
+docs/.hugo_build.lock
+docs/resources/_gen/

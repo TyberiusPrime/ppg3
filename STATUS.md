@@ -1290,3 +1290,49 @@ check runs before any other `run()` side effect, so a refused run leaves
 no trace. New: `python/ppg3/runscript.py`, `python/tests/test_runscript.py`
 (unit + subprocess e2e), two executed docs examples in `api/run.md`,
 CONTRACT.md addendum. Rust side untouched (the CLI ignores the file).
+
+## Webwatch phase 3: CLI-parity failure blocks + source browsing
+
+Feedback from first real use: the web page reduced a failure to a
+one-line exception + raw reason blob, while the console prints the full
+P9 block (`Job`/`Defined`/`Exception`/`Missing`/`Outputs`/`Kept`). Fixed
+in three pieces, still stdlib-only:
+
+**Failure records at CLI parity.** `webwatch._failure_records` now
+carries everything `RunResult._format_one_failure` renders: `defsite`,
+`missing` (the declared outputs the entry lacks), `kind`, and `kept`
+(the failed job's leftovers, same 5-file walk as the CLI's `Kept:`
+lines). Kind/defsite come from `failed_details` itself (RunResult's
+graph enrichment) — the `pass_run_failed` event's `job_kinds` field is
+gone; it read `result.job_kinds`, an attribute `RunResult` never had, so
+the first failing pass killed the whole watch loop with an
+`AttributeError` (found live; the tests passed job_kinds into the event
+by hand and never exercised the emitting line — the e2e test that would
+have caught it needs `_core`). The run drill-down also renders the
+verbatim `format_failures()` text ("full report (CLI format)"), which
+was already shipped in every snapshot but never shown.
+
+**Live failures in user terms.** The scheduler's event log speaks
+internal job ids (P1.5 violation on the live panel until now).
+`ppg3.run()` stashes `id -> {label, kind, defsite}` in the last-run-info
+slot *before* `_core.run` starts (same pattern as `events_path`), and
+`WatchState` joins it (injectable `job_meta_provider` for tests): live
+rows show labels, live failures get defsite/kind/missing/kept, and the
+meaningless non-CommandJob exit code is suppressed — only when the kind
+is actually known (a GraphJob-expanded job mid-run has no meta yet and
+renders by id, exit code shown rather than wrongly hidden).
+
+**Source browsing.** New `GET /source?path=<abs>` endpoint: a
+server-rendered, line-numbered, read-only file view; every line is a
+`#L<n>` anchor, CSS `:target` highlights it, so `Defined: file.py:41`
+links land on the exact line. Every file-naming field on the page is now
+a link (defsite frames, failure logs, kept files, watched paths, the
+script itself). Allowlist, not a file server: `/source` serves exactly
+the files the current state references (`WatchState.browsable_file`) and
+404s everything else; responses capped at 2 MB with a truncation notice.
+
++5 Python tests in `test_webwatch.py` (enriched records incl. kept-file
+walk, live meta join, no-meta fallback, /source allowlist + escaping +
+anchors, defsite/log reachability). 52 webwatch/watch tests green; the 4
+e2e subprocess tests fail in this container with or without the change
+(stale `_core`; verified against a stashed tree). Tutorial §6 updated.

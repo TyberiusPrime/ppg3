@@ -154,8 +154,9 @@ def _emit(on_event: Optional[WatchObserver], event_type: str, **fields: Any) -> 
     - ``pass_started``: ``n_run``, ``reason``, ``changed_paths`` (``None``
       on the initial run, else the changed-path list that triggered it)
     - ``pass_ok``: ``report`` (raw RunReport dict), ``generation``
-    - ``pass_run_failed``: ``report``, ``failed``, ``failed_details``,
-      ``job_kinds`` (RunResult's attributes), ``failures_text``
+    - ``pass_run_failed``: ``report``, ``failed``, ``failed_details``
+      (RunResult's attributes; each detail carries ``kind``/``defsite``
+      from the graph enrichment), ``failures_text``
       (``RunResult.format_failures()``)
     - ``pass_exception``: ``traceback`` (formatted text)
     - ``waiting``: ``watched_paths``
@@ -265,7 +266,6 @@ def run_watch(
                     report=get_last_run_info().get("report"),
                     failed=result.failed,
                     failed_details=result.failed_details,
-                    job_kinds=result.job_kinds,
                     failures_text=result.format_failures(),
                 )
             except KeyboardInterrupt:

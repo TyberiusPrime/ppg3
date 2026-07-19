@@ -175,6 +175,7 @@
               pkgs.cargo
               pyproject-nix.packages.${system}.build-editable
               ppg3-cli
+              pkgs.hugo
             ];
             env = {
               UV_NO_SYNC = "1";

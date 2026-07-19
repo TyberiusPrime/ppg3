@@ -701,6 +701,13 @@ _last_run_info: Dict[str, Any] = {
     # set *before* `_core.run` starts, so a live observer (webwatch's
     # tailer) can follow the run while jobs are still executing.
     "events_path": None,
+    # id -> {"label", "kind", "defsite"} (`_job_meta_from_graph`): the
+    # event log speaks internal job ids (it is written by the Rust
+    # scheduler, which knows nothing else), so a live observer needs this
+    # to render jobs in user terms (P1.5). Also set *before* `_core.run`
+    # starts (pre-expansion snapshot; refreshed with GraphJob-expanded
+    # jobs once the run returns).
+    "job_meta": {},
 }
 
 
@@ -835,6 +842,11 @@ def run(
     )
     prev_events = _last_run_info.get("events_path")
     _last_run_info["events_path"] = events_path
+    # P1.5 for live observers: the event log's internal ids need this
+    # translation table *while the run executes* — jobs a GraphJob expands
+    # mid-run are missing from it until the refresh below (they render by
+    # id until then).
+    _last_run_info["job_meta"] = _job_meta_from_graph(graph)
     if prev_events and prev_events != events_path:
         try:
             os.unlink(prev_events)
@@ -864,6 +876,7 @@ def run(
     _last_run_info["report"] = report
 
     job_meta = _job_meta_from_graph(graph)
+    _last_run_info["job_meta"] = job_meta
     partial_dir = os.path.join(graph.project_dir, "partial")
 
     if report.get("failed"):
